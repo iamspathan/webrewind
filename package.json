@@ -1,0 +1,20 @@
+{
+  "name": "webrewind",
+  "version": "1.0.0",
+  "main": "index.js",
+  "repository": "https://github.com/iamspathan/webrewind.git",
+  "author": "Sohail <sohail@apyhub.com>",
+  "license": "MIT",
+  "private": true,
+  "workspaces": [
+    "server",
+    "client"
+  ],
+"scripts": {
+  "start": "concurrently \"yarn workspace server start\" \"yarn workspace client start\""
+},
+
+  "dependencies": {
+    "concurrently": "^9.1.0"
+  }
+}
