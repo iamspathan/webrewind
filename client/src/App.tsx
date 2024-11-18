@@ -1,31 +1,16 @@
-import { Button } from "./components/ui/button.tsx";
-import "./styles.css";
-import React, { useEffect } from "react";
+import React from 'react'
+import './App.css'
+import URLYearPickerWith3D from './url-year-picker-3d'
 
 function App() {
-  // useEffect(() => {
-  //   fetch("/test")
-  //     .then((res) => res.json())
-  //     .then((data) => console.log(data));
-  // }, []);
-
   return (
-    <div className="App">
-      <Button  variant={"outline"}>Click me</Button>
-      <div>
-      </div>
-      <header className="App-header">
-        <a
-          className="App-link"
-          href="https://reactjs.org"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          Webrewind
-        </a>
-      </header>
+    <div className="min-h-screen bg-background flex items-center justify-center p-4">
+      <main className="w-full max-w-md">
+        <h1 className="text-3xl font-bold text-center mb-6">URL Year Picker</h1>
+        <URLYearPickerWith3D />
+      </main>
     </div>
-  );
+  )
 }
 
-export default App;
+export default App
