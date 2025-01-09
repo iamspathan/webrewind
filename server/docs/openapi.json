@@ -1,0 +1,89 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "Webrewind API",
+    "version": "1.0.0",
+    "description": "API Documentation"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:3200"
+    }
+  ],
+  "paths": {
+    "/test": {
+      "get": {
+        "summary": "Test endpoint",
+        "responses": {
+          "200": {
+            "description": "A successful response"
+          }
+        }
+      }
+    },
+    "/screenshots": {
+      "post": {
+        "summary": "Generate screenshots and return image paths",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "url": {
+                    "type": "string",
+                    "description": "The URL to capture screenshots from"
+                  },
+                  "startYear": {
+                    "type": "integer",
+                    "description": "The start year for capturing screenshots"
+                  },
+                  "endYear": {
+                    "type": "integer",
+                    "description": "The end year for capturing screenshots"
+                  },
+                  "outputFileName": {
+                    "type": "string",
+                    "description": "The base name for output files"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "A list of image paths",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "images": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing required parameters"
+          },
+          "404": {
+            "description": "No images found"
+          },
+          "500": {
+            "description": "An error occurred while taking screenshots or creating GIF"
+          }
+        }
+      }
+    }
+  },
+  "components": {},
+  "tags": []
+}
