@@ -7,20 +7,26 @@
     "start": "nodemon index.js"
   },
   "dependencies": {
+    "aws-sdk": "^2.1692.0",
     "axios": "^1.1.3",
     "canvas": "^2.11.2",
     "class-variance-authority": "^0.7.0",
     "clsx": "^2.1.1",
+    "cors": "^2.8.5",
     "express": "^4.21.1",
     "gif-encoder-2": "^1.0.5",
     "install": "^0.13.0",
     "lucide-react": "^0.460.0",
     "npm": "^8.19.2",
     "puppeteer": "^19.1.0",
+    "swagger-jsdoc": "^6.2.8",
+    "swagger-ui-express": "^5.0.1",
     "tailwind-merge": "^2.5.4",
     "tailwindcss-animate": "^1.0.7"
   },
   "devDependencies": {
-    "nodemon": "^3.1.7"
+    "nodemon": "^3.1.7",
+    "swagger-autogen": "^2.23.7",
+    "wrangler": "^3.87.0"
   }
 }
