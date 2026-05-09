@@ -283,6 +283,10 @@ export function InteractiveTimeline({
               key={frame.index}
               ref={registerCard(i)}
               frame={frame}
+              // Prior frame in chronological order — enables the diff
+              // caption. Undefined on the first card, where there's
+              // nothing to compare against.
+              prevFrame={i > 0 ? frames[i - 1] : undefined}
               originalUrl={url}
               isActive={i === activeIndex}
               cacheKey={cacheKey}

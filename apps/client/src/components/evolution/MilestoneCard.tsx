@@ -7,6 +7,10 @@ import { formatLabel, waybackSourceUrl, type Frame } from "./types";
 
 interface Props {
   frame: Frame;
+  // Prior frame in chronological order, when one exists. Undefined for
+  // the first card in the timeline — that card gets a standalone
+  // descriptive caption instead of a diff one.
+  prevFrame?: Frame;
   originalUrl: string;
   isActive: boolean;
   // Null until the server's `done` SSE arrives with the manifest key —
@@ -33,6 +37,7 @@ export const MilestoneCard = forwardRef<HTMLElement, Props>(
   function MilestoneCard(
     {
       frame,
+      prevFrame,
       originalUrl,
       isActive,
       cacheKey,
@@ -49,6 +54,11 @@ export const MilestoneCard = forwardRef<HTMLElement, Props>(
       cacheKey,
       frameIndex: frame.index,
       imageUrl: frame.url,
+      // Prev fields are only set when we have a predecessor — the server
+      // uses their presence to choose diff vs. single-image mode.
+      prevImageUrl: prevFrame ? prevFrame.url : null,
+      prevLabel: prevFrame ? formatLabel(prevFrame) : undefined,
+      currLabel: label,
       initialSummary,
       enabled: summaryEnabled,
     });

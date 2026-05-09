@@ -36,6 +36,12 @@ interface Args {
   cacheKey: string | null;
   frameIndex: number;
   imageUrl: string;
+  // Optional diff-mode inputs. When `prevImageUrl` is set the server
+  // generates a "what changed between these two frames" caption instead
+  // of a standalone description. Absent on the first card (no prior).
+  prevImageUrl?: string | null;
+  prevLabel?: string;
+  currLabel?: string;
   initialSummary?: string;
   enabled: boolean;
 }
@@ -50,6 +56,9 @@ export function useSummary({
   cacheKey,
   frameIndex,
   imageUrl,
+  prevImageUrl,
+  prevLabel,
+  currLabel,
   initialSummary,
   enabled,
 }: Args): State {
@@ -95,7 +104,15 @@ export function useSummary({
         const res = await fetch(`${API_BASE_URL}/summaries`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ cacheKey, frameIndex, imageUrl }),
+          body: JSON.stringify({
+            cacheKey,
+            frameIndex,
+            imageUrl,
+            // Only send diff fields when we actually have a prior frame
+            // to compare against — the server falls back to single-image
+            // mode on absence.
+            ...(prevImageUrl ? { prevImageUrl, prevLabel, currLabel } : {}),
+          }),
           signal: controller.signal,
         });
         if (cancelled) return;
@@ -153,11 +170,14 @@ export function useSummary({
       controller.abort();
     };
     // `summary` and `initialSummary` intentionally excluded — they're
-    // read only on the first run of this effect; `enabled` monotonically
-    // flips false→true, and cacheKey/frameIndex/imageUrl are stable for
-    // the lifetime of a MilestoneCard.
+    // read only on the first run of this effect. `enabled` monotonically
+    // flips false→true; cacheKey/frameIndex/imageUrl are stable for a
+    // given MilestoneCard. prevImageUrl/prevLabel/currLabel are derived
+    // from the same stable frames array, so they're also one-shot —
+    // listing them here only so a hypothetical future reorder forces
+    // a refetch rather than silently mixing captions across cards.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cacheKey, frameIndex, imageUrl, enabled]);
+  }, [cacheKey, frameIndex, imageUrl, prevImageUrl, enabled]);
 
   return { summary, loading, error };
 }

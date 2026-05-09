@@ -1182,6 +1182,9 @@ app.get("/screenshots/events/:jobId", (req, res) => {
  *               cacheKey: { type: string, description: "sha256 hex returned in the done SSE event" }
  *               frameIndex: { type: integer }
  *               imageUrl: { type: string, description: "must start with MINIO_PUBLIC_URL/BUCKET/" }
+ *               prevImageUrl: { type: string, description: "Optional — when supplied (and in the same bucket) the endpoint returns a diff caption describing what changed from prev → current" }
+ *               prevLabel: { type: string, description: "Human label for prev frame (e.g. 'March 2017'). Shown to the model for narration." }
+ *               currLabel: { type: string, description: "Human label for current frame. Paired with prevLabel." }
  *     responses:
  *       200: { description: "{ summary }" }
  *       400: { description: Invalid parameters }
@@ -1197,7 +1200,17 @@ app.post("/summaries", summariesRateLimiter, async (req, res) => {
     });
   }
 
-  const { cacheKey, frameIndex, imageUrl } = req.body || {};
+  const {
+    cacheKey,
+    frameIndex,
+    imageUrl,
+    // Optional diff-mode inputs. When prevImageUrl is present and points
+    // at the same bucket, the endpoint produces a two-image "what
+    // changed?" caption instead of describing the current frame alone.
+    prevImageUrl,
+    prevLabel,
+    currLabel,
+  } = req.body || {};
   const errs = [];
   if (typeof cacheKey !== "string" || !/^[a-f0-9]{64}$/.test(cacheKey)) {
     errs.push("cacheKey must be a sha256 hex string");
@@ -1223,6 +1236,20 @@ app.post("/summaries", summariesRateLimiter, async (req, res) => {
       .json({ error: "imageUrl must point at this server's bucket" });
   }
 
+  // Same check for prevImageUrl when diff mode is requested. Reject
+  // outright rather than silently degrading — misconfigured callers
+  // should hear about it.
+  let prevObjectKey = null;
+  if (typeof prevImageUrl === "string" && prevImageUrl.length > 0) {
+    prevObjectKey = storage.keyFromPublicUrl(prevImageUrl);
+    if (!prevObjectKey) {
+      mSummariesTotal.inc({ outcome: "rejected" });
+      return res
+        .status(400)
+        .json({ error: "prevImageUrl must point at this server's bucket" });
+    }
+  }
+
   let object;
   try {
     object = await storage.getObjectBytes(objectKey);
@@ -1239,11 +1266,33 @@ app.post("/summaries", summariesRateLimiter, async (req, res) => {
     return res.status(404).json({ error: "image not found" });
   }
 
+  // Best-effort prev fetch: if it fails we fall back to single-image
+  // mode rather than erroring out — the caption is still useful.
+  let prevObject = null;
+  if (prevObjectKey) {
+    try {
+      prevObject = await storage.getObjectBytes(prevObjectKey);
+    } catch (err) {
+      log.warn("summaries: prev fetch failed, falling back to single", {
+        key: prevObjectKey,
+        err: err.message,
+      });
+    }
+    if (!prevObject || !prevObject.body) {
+      prevObject = null;
+    }
+  }
+
   try {
-    const summary = await summarize.summarizeImage(
-      object.body,
-      object.contentType
-    );
+    const summary = prevObject
+      ? await summarize.summarizeDiff(
+          object.body,
+          object.contentType,
+          prevObject.body,
+          prevObject.contentType,
+          { prevLabel, currLabel }
+        )
+      : await summarize.summarizeImage(object.body, object.contentType);
 
     // Fire-and-forget cache write. A failure here just means the next
     // request for the same slot will regenerate — we still return the
