@@ -18,27 +18,22 @@ The Webrewind is a tool designed to help developers and designers track and visu
 
 ## Screenshot
 
-![Webrewind Screenshot](client/public/screely-1736442296819.png)
+![Webrewind Screenshot](apps/client/public/screely-1736442296819.png)
 
 # Project Structure
-```bash
-WEBREWIND
 
-├── client
-│   ├── node_modules
-│   └── public
-    └── sr
-├── node_modules
-├── server
-│   ├── node_modules
-│   └── docs
-│   └── util
+Turborepo + Yarn workspaces monorepo.
+
+```bash
+webrewind/
+├── apps/
+│   ├── client/     # Vite + React + TS  (@webrewind/client)
+│   └── server/     # Express + Puppeteer (@webrewind/server)
+├── turbo.json      # pipeline config
+├── package.json    # root workspace config
 ├── .gitignore
-├── package-lock.json
-├── package.json
 ├── README.md
 └── yarn.lock
-
 ```
 
 ## Getting Started
@@ -65,13 +60,21 @@ WEBREWIND
 
 ### Running Locally
 
-1. Start the development server:
+1. Start both client and server via Turborepo:
 
    ```bash
-   npm start
+   yarn dev
    ```
 
-2. Open your browser and navigate to `http://localhost:5173` to view the project.
+2. Open your browser and navigate to `http://localhost:5173` for the client. The server runs on `http://localhost:3200`.
+
+### Useful scripts
+
+- `yarn dev` — run all apps in dev mode (turbo)
+- `yarn build` — build all apps
+- `yarn lint` — lint all apps
+- `yarn workspace @webrewind/client dev` — run just the client
+- `yarn workspace @webrewind/server dev` — run just the server
 
 ## Contributing
 
