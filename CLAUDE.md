@@ -22,13 +22,16 @@ webrewind/
 │   └── server/           # Express + Puppeteer backend  (@webrewind/server)
 │       ├── index.js                         # API + screenshot/GIF pipeline
 │       ├── util/wayback.js                  # Wayback CDX API client
-│       └── util/cloudflare.js               # (commented out) R2 storage helpers
+│       ├── util/storage.js                  # MinIO/S3 client (aws-sdk)
+│       ├── util/gif.js                      # streaming GIF encoder (buffer sink)
+│       └── util/cache.js                    # result cache backed by MinIO
 ```
 
 ## Tech stack
 
 - **Client:** React 18, TypeScript, Vite, Tailwind CSS, Radix UI, react-hook-form + zod, framer-motion, react-three-fiber/drei (Three.js), date-fns
-- **Server:** Node.js, Express, Puppeteer (headless Chromium), canvas + gif-encoder-2, axios, swagger-jsdoc/ui-express, aws-sdk (for Cloudflare R2, currently disabled)
+- **Server:** Node.js, Express, Puppeteer (headless Chromium), canvas + gif-encoder-2, axios, swagger-jsdoc/ui-express, aws-sdk (talks to MinIO)
+- **Storage:** MinIO (S3-compatible). Frames and GIFs are uploaded to a public bucket; the browser loads them by direct URL.
 - **Monorepo:** Yarn 1 workspaces + Turborepo 2.x
 
 ## Commands
@@ -60,21 +63,35 @@ Turbo artifacts (`.turbo/`, `dist/`, `build/`) are gitignored.
 
 ## Architecture notes
 
-### Screenshot pipeline (`apps/server/index.js`)
-1. `getURLs()` in `util/wayback.js` hits the Wayback CDX API (`https://web.archive.org/cdx/search/cdx/`) and returns public archive URLs filtered by year range and `collapse=timestamp:6`.
-2. `run()` launches Puppeteer, visits each archive URL, removes the Wayback toolbar (`#wm-ipp-base`) via `page.evaluate`, and writes PNGs to `screenshots-<outputFileName>/`.
-3. `createGifFromScreenshots()` stitches PNGs into a GIF using `canvas` + `gif-encoder-2`.
-4. `POST /screenshots` — currently short-circuits: the `run()`/GIF path is commented out and it only returns existing PNG paths from a preexisting `screenshots-<outputFileName>/` folder. Be aware when editing.
-5. Swagger UI is mounted at `/` (server root); spec is regenerated to `apps/server/docs/openapi.json` on boot.
+### HTTP surface (`apps/server/index.js`)
+- `GET /health` — liveness check (`{status, uptime}`)
+- `GET /docs` — Swagger UI (spec also written to `apps/server/docs/openapi.json` on boot)
+- `GET /metrics` — Prometheus text-format metrics
+- `POST /screenshots` — accepts a job and returns `202 { jobId, streamUrl }`. Progress is streamed over SSE; the terminal `done` event carries `{ images, gif, count }` with direct MinIO URLs.
+- `DELETE /screenshots/:jobId` — cancel an in-flight job
+- `GET /screenshots/events/:jobId` — SSE progress stream
+- 404 + error middleware return structured JSON.
+
+The server no longer serves image bytes itself — frames and GIFs are uploaded to MinIO and returned as direct URLs (see `MINIO_PUBLIC_URL`).
+
+### Screenshot pipeline
+1. `util/wayback.js :: getURLs()` queries the Wayback CDX API (`https://web.archive.org/cdx/search/cdx/`) with `collapse=timestamp:6`.
+2. `run()` clears any prior objects under `<outputFileName>/` in MinIO (`deletePrefix`), then drives a Puppeteer worker pool through each archive URL, strips `#wm-ipp-base`, and captures the viewport to a Buffer.
+3. Each Buffer is uploaded to MinIO at `<outputFileName>/<index>.<ext>` and fed to the streaming GIF encoder (`util/gif.js`) in parallel. The encoder buffers out-of-order frames and drains them in index order.
+4. On success, the encoded GIF Buffer is uploaded to `<outputFileName>/<outputFileName>.gif`. The result manifest (`{ images, gif, count }`) is cached under `_cache/<sha256>.json`.
+5. All image URLs in responses are built via `storage.buildPublicUrl()` using `MINIO_PUBLIC_URL`; the bucket is expected to allow anonymous `GetObject` on its contents.
 
 ### Client
 - Single-page app: `App.tsx` → `WebsiteEvolutionViewer.tsx`.
 - Form uses `react-hook-form` + `zod` (schema: url, startYear, endYear, outputFileName).
+- API base URL: `import.meta.env.VITE_API_BASE_URL` (empty → same-origin via Vite proxy).
+- Error states from the server (including structured `details`) are surfaced in a red alert banner.
 - 3D scene via `@react-three/fiber` / `drei`.
 - Path alias `@/*` → `apps/client/src/*` (see `vite.config.ts`, `tsconfig.json`).
+- Vite dev proxy (see `vite.config.ts`) forwards `/screenshots`, `/health`, `/docs` to `VITE_API_PROXY_TARGET` (defaults to `http://localhost:3200`). Images are NOT proxied — they load directly from MinIO (`MINIO_PUBLIC_URL`, default `http://localhost:9000`).
 
 ### CORS
-Server allows origin `http://localhost:5173` with `GET`/`POST` only.
+Server reads `CLIENT_ORIGIN` (default `http://localhost:5173`) and allows `GET`/`POST` only.
 
 ## Conventions
 
@@ -82,16 +99,33 @@ Server allows origin `http://localhost:5173` with `GET`/`POST` only.
 - Server code is CommonJS (`require`). Client is ESM + TypeScript.
 - Workspace names are scoped (`@webrewind/*`) — use the scoped name when invoking `yarn workspace …`.
 - UI components follow the shadcn/ui pattern (see `components.json`). Keep new ones consistent: Radix primitive + `cn()` from `lib/utils.ts` + class-variance-authority variants.
-- Generated artifacts under `apps/server/screenshots-*/` are committed to the repo — don't delete them unless asked.
 
 ## Known quirks / watch out for
 
-- `apps/server/util/cloudflare.js` is entirely commented out; `index.js` still imports it and references `cloudflarestorage.listFolders` in `GET /folders`, which will throw at runtime. Flag before using that route.
-- `require("inspector").console` is imported in `apps/server/index.js` — shadows the global `console`; unusual but intentional-looking. Leave alone unless fixing.
 - Puppeteer 19.x uses `page.waitForXPath`, which was removed in later versions. Any Puppeteer upgrade requires migration to `waitForSelector` with an XPath locator.
-- `POST /screenshots` does not actually run the capture pipeline in the current code — it only lists preexisting PNGs. If a user expects capture, confirm which behavior they want.
-- The client had a CRA-style `"proxy"` field which has been removed during the monorepo migration (Vite ignores it). If you need the client to proxy `/api` to the server, add `server.proxy` in `vite.config.ts`.
+- `outputFileName` is strictly validated server-side (`[A-Za-z0-9_-]{1,64}`). Spaces, slashes, and Unicode are rejected with HTTP 400.
+- GIF encoding uses `canvas` which needs native Cairo/Pango — `yarn install` compiles it. On Apple Silicon you may need `brew install pkg-config cairo pango libpng jpeg giflib librsvg`.
 
 ## Environment variables
 
-Only referenced in the commented-out `cloudflare.js`: `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`. Server port overridable via `port` (note: lowercase, not `PORT`).
+### Server (`apps/server/.env`)
+- `PORT` — default `3200`
+- `CLIENT_ORIGIN` — CORS origin, default `http://localhost:5173`
+- `PUBLIC_BASE_URL` — base URL used when constructing `/screenshots` and `/screenshots/events/<id>` URLs in responses. Default `http://localhost:${PORT}`. Image URLs are built from `MINIO_PUBLIC_URL` instead.
+- `MINIO_ENDPOINT` — internal URL the server uses to PUT/DELETE objects (e.g. `http://minio:9000` in compose, `http://localhost:9000` standalone).
+- `MINIO_PUBLIC_URL` — public URL the BROWSER uses to GET objects. Defaults to `MINIO_ENDPOINT`. **Set this in production to the publicly reachable MinIO/S3 hostname.**
+- `MINIO_BUCKET` — default `webrewind`. Expected to allow anonymous `GetObject`.
+- `MINIO_REGION` — default `us-east-1`.
+- `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` — credentials.
+- `CACHE_ENABLED` — set to `false` to disable the result cache entirely.
+- `EXTRA_CA_CERT_PATH` — absolute path to a PEM cert to trust for outbound HTTPS (corporate proxies / MITM). `util/wayback.js` reads this and attaches a custom `https.Agent` to axios. Preferred over `NODE_EXTRA_CA_CERTS` because dotenv loads after Node already read that var.
+- `INSECURE_TLS` — set to `true` to disable cert verification for the Wayback axios client. Dev escape hatch only.
+- `CAPTURE_CONCURRENCY` — parallel Puppeteer pages per job. Default `4`. Each page is ~120MB RAM.
+- `CAPTURE_NAV_TIMEOUT_MS` — per-page navigation timeout. Default `25000`.
+- `CAPTURE_NETWORK_IDLE_MS` / `CAPTURE_NETWORK_IDLE_TIMEOUT_MS` — how long to wait for the archived page to go quiet after DOMContentLoaded (default `400` / `5000`). If the page never idles we screenshot anyway.
+
+### Client (`apps/client/.env`)
+- `VITE_API_BASE_URL` — base URL for API calls. Empty in dev (uses Vite proxy). Set to public API hostname in prod.
+- `VITE_API_PROXY_TARGET` — dev-only proxy target, default `http://localhost:3200`.
+
+`.env.example` files are checked in for both workspaces; `.env` is gitignored.

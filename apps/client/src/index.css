@@ -8,14 +8,18 @@
   line-height: 1.5;
   font-weight: 400;
 
-  color-scheme: light dark;
-  color: rgba(255, 255, 255, 0.87);
-  background-color: #242424;
+  color-scheme: dark;
+  color: #f4ead5;
+  background-color: #0d0b08;
 
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+html, body {
+  background-color: #0d0b08;
 }
 
 a {
@@ -29,8 +33,6 @@ a:hover {
 
 body {
   margin: 0;
-  display: flex;
-  place-items: center;
   min-width: 320px;
   min-height: 100vh;
 }
@@ -59,18 +61,6 @@ button:focus-visible {
   outline: 4px auto -webkit-focus-ring-color;
 }
 
-@media (prefers-color-scheme: light) {
-  :root {
-    color: #213547;
-    background-color: #ffffff;
-  }
-  a:hover {
-    color: #747bff;
-  }
-  button {
-    background-color: #f9f9f9;
-  }
-}
 
 @layer base {
   :root {
@@ -135,4 +125,48 @@ button:focus-visible {
   body {
     @apply bg-background text-foreground;
   }
+}
+
+/* ===========================
+   Webrewind cinematic theme
+   Documentary / archival palette used by components/evolution/*
+   =========================== */
+:root {
+  --reel-bg: #0d0b08;
+  --reel-bg-soft: #16120c;
+  --reel-paper: #f4ead5;
+  --reel-ink: #1a1410;
+  --reel-amber: #d4a24c;
+  --reel-amber-glow: #f6c56a;
+  --reel-sepia: #8b6a3d;
+  --reel-grain-opacity: 0.06;
+}
+
+@keyframes reel-kenburns-0 {
+  from { transform: scale(1) translate(0, 0); }
+  to   { transform: scale(1.08) translate(-2%, -1.5%); }
+}
+@keyframes reel-kenburns-1 {
+  from { transform: scale(1) translate(0, 0); }
+  to   { transform: scale(1.08) translate(2%, -1%); }
+}
+@keyframes reel-kenburns-2 {
+  from { transform: scale(1) translate(0, 0); }
+  to   { transform: scale(1.08) translate(1.5%, 2%); }
+}
+@keyframes reel-kenburns-3 {
+  from { transform: scale(1) translate(0, 0); }
+  to   { transform: scale(1.08) translate(-1.5%, 1.5%); }
+}
+
+.reel-kenburns {
+  animation: reel-kenburns-0 8s ease-out forwards;
+  will-change: transform;
+}
+.reel-kenburns[data-variant="1"] { animation-name: reel-kenburns-1; }
+.reel-kenburns[data-variant="2"] { animation-name: reel-kenburns-2; }
+.reel-kenburns[data-variant="3"] { animation-name: reel-kenburns-3; }
+
+@media (prefers-reduced-motion: reduce) {
+  .reel-kenburns { animation: none !important; }
 }

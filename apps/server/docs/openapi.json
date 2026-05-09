@@ -11,74 +11,71 @@
     }
   ],
   "paths": {
-    "/test": {
+    "/health": {
       "get": {
-        "summary": "Test endpoint",
+        "summary": "Health check",
         "responses": {
           "200": {
-            "description": "A successful response"
+            "description": "OK"
           }
         }
       }
     },
-    "/screenshots": {
-      "post": {
-        "summary": "Generate screenshots and return image paths",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "url": {
-                    "type": "string",
-                    "description": "The URL to capture screenshots from"
-                  },
-                  "startYear": {
-                    "type": "integer",
-                    "description": "The start year for capturing screenshots"
-                  },
-                  "endYear": {
-                    "type": "integer",
-                    "description": "The end year for capturing screenshots"
-                  },
-                  "outputFileName": {
-                    "type": "string",
-                    "description": "The base name for output files"
-                  }
-                }
-              }
-            }
-          }
-        },
+    "/metrics": {
+      "get": {
+        "summary": "Prometheus metrics (text/plain; version=0.0.4)",
         "responses": {
           "200": {
-            "description": "A list of image paths",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "images": {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
-                      }
-                    }
-                  }
-                }
-              }
+            "description": "Metrics snapshot"
+          }
+        }
+      }
+    },
+    "/screenshots/{jobId}": {
+      "delete": {
+        "summary": "Cancel an in-flight capture job",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "jobId",
+            "required": true,
+            "schema": {
+              "type": "string"
             }
-          },
-          "400": {
-            "description": "Missing required parameters"
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Cancellation requested"
           },
           "404": {
-            "description": "No images found"
+            "description": "Unknown jobId"
           },
-          "500": {
-            "description": "An error occurred while taking screenshots or creating GIF"
+          "409": {
+            "description": "Job already finished"
+          }
+        }
+      }
+    },
+    "/screenshots/events/{jobId}": {
+      "get": {
+        "summary": "SSE stream of progress events for a capture job",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "jobId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "text/event-stream"
+          },
+          "404": {
+            "description": "Unknown jobId"
           }
         }
       }

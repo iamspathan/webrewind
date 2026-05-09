@@ -3,3 +3,21 @@ node_modules
 .turbo
 dist
 build
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+yarn-debug.log*
+yarn-error.log*
+npm-debug.log*
+
+# Server cache (mirrors .dockerignore)
+apps/server/.cache
+
+# Test + typecheck outputs
+coverage
+playwright-report
+test-results
+*.tsbuildinfo

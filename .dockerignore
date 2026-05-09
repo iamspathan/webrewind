@@ -1,0 +1,33 @@
+# Keep build context small. Excluding node_modules is critical — a full
+# yarn install inside the image is cheaper than sending ~2GB of the host's
+# node_modules over the Docker daemon.
+
+**/node_modules
+**/.turbo
+**/dist
+**/build
+**/.cache
+
+# Local env + auth.
+**/.env
+**/.env.local
+**/.env.*.local
+
+# Git + editor.
+.git
+.gitignore
+.github
+.vscode
+.idea
+*.log
+
+apps/server/.cache
+
+# Docker's own artifacts.
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# OS junk.
+.DS_Store
+Thumbs.db

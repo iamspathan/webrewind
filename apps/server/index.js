@@ -1,317 +1,1093 @@
+require("dotenv").config();
+
+const crypto = require("crypto");
+const { EventEmitter } = require("events");
 const express = require("express");
-const puppeteer = require('puppeteer');
-const fs = require('fs')
-const cors = require('cors');
-const {createWriteStream , readdir} = require('fs');
-const { getURLs } = require('./util/wayback');
-const { exec } = require('child_process');
-const GIFEncoder = require('gif-encoder-2');
-const path = require('path');
-const { createCanvas, Image } = require('canvas');
-const { promisify } = require('util');
-const cloudflarestorage = require('./util/cloudflare');
-const { console } = require("inspector");
+const rateLimit = require("express-rate-limit");
+const puppeteer = require("puppeteer");
+const fs = require("fs");
+const cors = require("cors");
+const path = require("path");
 const swaggerJSDoc = require("swagger-jsdoc");
-const swaggerUi  = require('swagger-ui-express');
+const swaggerUi = require("swagger-ui-express");
 
+const { getURLs } = require("./util/wayback");
+const log = require("./util/logger");
+const { createCache } = require("./util/cache");
+const { createStreamingGifEncoder } = require("./util/gif");
+const storage = require("./util/storage");
+const metrics = require("./util/metrics");
 
-const swaggerOptions = {
+// outputFileName validation — stays in this file so the route handler has
+// a single source of truth. Also used as an object-key prefix in MinIO.
+const SAFE_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+// Register metrics up front so /metrics reports zeros for unused ones
+// (makes PromQL rate()/increase() behave sensibly from first scrape).
+const mJobsTotal = metrics.counter(
+  "webrewind_jobs_total",
+  "Capture jobs by terminal status"
+);
+const mCapturesTotal = metrics.counter(
+  "webrewind_captures_total",
+  "Individual frame captures that succeeded"
+);
+const mCapturesSkippedTotal = metrics.counter(
+  "webrewind_captures_skipped_total",
+  "Individual frame captures that were skipped after retries"
+);
+const mCacheHits = metrics.counter(
+  "webrewind_cache_hits_total",
+  "Result cache hits on POST /screenshots"
+);
+const mCacheMisses = metrics.counter(
+  "webrewind_cache_misses_total",
+  "Result cache misses on POST /screenshots"
+);
+const mBrowserRecycles = metrics.counter(
+  "webrewind_browser_recycles_total",
+  "Shared Puppeteer browser recycle events by reason"
+);
+const mHttpRequests = metrics.counter(
+  "webrewind_http_requests_total",
+  "Completed HTTP requests by route+status"
+);
+const mActiveJobs = metrics.gauge(
+  "webrewind_active_jobs",
+  "Capture jobs currently running"
+);
+const mUploadsTotal = metrics.counter(
+  "webrewind_uploads_total",
+  "Objects uploaded to MinIO by kind"
+);
+const mUploadErrors = metrics.counter(
+  "webrewind_upload_errors_total",
+  "Failed object uploads by kind"
+);
+
+const resultCache = createCache({ storage });
+
+// ---------- Config ----------
+const PORT = Number(process.env.PORT || process.env.port || 3200);
+const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "http://localhost:5173";
+const PUBLIC_BASE_URL =
+  process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
+const JOB_TTL_MS = 10 * 60 * 1000; // drop finished jobs after 10 minutes
+
+// Capture tuning — override via env for different hardware.
+const CAPTURE_CONCURRENCY = Math.max(
+  1,
+  Number(process.env.CAPTURE_CONCURRENCY || 4)
+);
+const NAV_TIMEOUT_MS = Number(process.env.CAPTURE_NAV_TIMEOUT_MS || 25000);
+const NETWORK_IDLE_MS = Number(process.env.CAPTURE_NETWORK_IDLE_MS || 400);
+const NETWORK_IDLE_TIMEOUT_MS = Number(
+  process.env.CAPTURE_NETWORK_IDLE_TIMEOUT_MS || 5000
+);
+
+// Admission control.
+const MAX_ACTIVE_JOBS = Math.max(
+  1,
+  Number(process.env.MAX_ACTIVE_JOBS || 3)
+);
+const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000);
+const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 5);
+const TRUST_PROXY =
+  String(process.env.TRUST_PROXY || "").toLowerCase() === "true" ||
+  process.env.TRUST_PROXY === "1";
+
+// Hosts known to hang archived pages (ads / analytics / tag managers).
+// Aborting their requests shaves 2–10s per capture on older pages.
+const BLOCK_HOSTS_RE = new RegExp(
+  [
+    "google-analytics\\.com",
+    "googletagmanager\\.com",
+    "googlesyndication\\.com",
+    "doubleclick\\.net",
+    "facebook\\.net",
+    "connect\\.facebook\\.net",
+    "scorecardresearch\\.com",
+    "chartbeat\\.com",
+    "hotjar\\.com",
+    "mouseflow\\.com",
+    "segment\\.io",
+    "mixpanel\\.com",
+    "adroll\\.com",
+    "adsrvr\\.org",
+    "newrelic\\.com",
+  ].join("|")
+);
+
+// Resource types we can safely block without harming the screenshot.
+const BLOCKED_RESOURCE_TYPES = new Set([
+  "font",
+  "media",
+  "websocket",
+  "eventsource",
+  "manifest",
+  "other",
+]);
+
+// ---------- Swagger ----------
+const swaggerDocs = swaggerJSDoc({
   swaggerDefinition: {
-    openapi: '3.0.0',
+    openapi: "3.0.0",
     info: {
-      title: 'Webrewind API',
-      version: '1.0.0',
-      description: 'API Documentation',
+      title: "Webrewind API",
+      version: "1.0.0",
+      description: "API Documentation",
     },
-    servers: [
-      {
-        url: 'http://localhost:3200', // Replace with your server URL
-      },
-    ],
+    servers: [{ url: PUBLIC_BASE_URL }],
   },
-  apis: ['./index.js'], // Path to the API docs
-};
-
-// Initialize Swagger JSDoc
-const swaggerDocs = swaggerJSDoc(swaggerOptions);
-// Write the specification to a file in the docs folder
-const docsFolderPath = path.resolve(__dirname, 'docs');
-if (!fs.existsSync(docsFolderPath)) {
-  fs.mkdirSync(docsFolderPath);
-}
-fs.writeFileSync(path.join(docsFolderPath, 'openapi.json'), JSON.stringify(swaggerDocs, null, 2));
-
-const port = process.env.port || 3200;
-
-const app = express();
-
-app.use(express.json());
-
-app.use(cors({
-  origin: 'http://localhost:5173', // Replace with your frontend's origin
-  methods: ['GET', 'POST'], // Specify the methods you want to allow, // Specify the headers you want to allow
-}))
-
-// Set up Swagger UI
-app.use('/', swaggerUi.serve, swaggerUi.setup(swaggerDocs));
-
-
-/**
-   * @swagger
-   * /test:
-   *   get:
-   *     summary: Test endpoint
-   *     responses:
-   *       200:
-   *         description: A successful response
-   */
-app.get("/test", (req, res) => {
-  res.send({ date: "This is returned from server" });
+  apis: ["./index.js"],
 });
 
-const readdirAsync = promisify(readdir);
+const docsFolderPath = path.resolve(__dirname, "docs");
+if (!fs.existsSync(docsFolderPath)) {
+  fs.mkdirSync(docsFolderPath, { recursive: true });
+}
+fs.writeFileSync(
+  path.join(docsFolderPath, "openapi.json"),
+  JSON.stringify(swaggerDocs, null, 2)
+);
 
-async function takeScreenshotOfPage(
-  url,
-  browser,
-  page,
-  filename,
-  screenshotFolderName
-) {
-  console.log("taking screenshot of ", url);
+// ---------- App ----------
+const app = express();
 
-  await page.goto(`${url}`, {
-    /// domcontentloaded
-    /// networkidle0
-    /// load
-    timeout: 60000,
-    waitUntil: "networkidle0",
-  });
-
-  ///Wait for Wayback navigation to appear in DOM then delete it
-  await page.waitForXPath(`//*[@id="wm-ipp-base"]`);
-  await page.evaluate(async (ID) => {
-    //   const selectors = Array.from(document.querySelectorAll("img"));
-    //   await Promise.all(selectors.map(img => {
-    //   if (img.complete) return;
-    //   return new Promise((resolve, reject) => {
-    //     img.addEventListener('load', resolve);
-    //     img.addEventListener('error', reject);
-    //   });
-    // }));
-
-    var element = document.getElementById(ID);
-    element.parentNode.removeChild(element);
-  }, "wm-ipp-base");
-
-  await page.screenshot({ path: `${screenshotFolderName}/${filename}.png` });
+// When behind a reverse proxy, trust X-Forwarded-* so rate limiting sees
+// the real client IP. Opt-in via env to avoid spoofing in dev.
+if (TRUST_PROXY) {
+  app.set("trust proxy", 1);
 }
 
-async function run(url, startYear, endYear, outputFileName) {
-  const maxNumberOfCaptures = 300;
-  const screenshotFolderName = `screenshots-${outputFileName}`;
-  const startIndex = 0;
-  const collapse = "timestamp:6";
-  const windowSize = { width: 1366, height: 1366 };
+app.use(express.json());
+app.use(
+  cors({
+    origin: CLIENT_ORIGIN,
+    methods: ["GET", "POST", "DELETE"],
+    exposedHeaders: ["X-Request-Id"],
+  })
+);
 
-  const browser = await puppeteer.launch({ headless: true });
-  const page = await browser.newPage();
-  await page.setViewport(windowSize);
+// Request ID middleware — accept X-Request-Id from upstream (e.g. load
+// balancer, curl --header) or mint a fresh UUID. Always echoed back on
+// the response so clients can correlate logs with their call.
+app.use((req, res, next) => {
+  const incoming = req.get("x-request-id");
+  req.id =
+    typeof incoming === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(incoming)
+      ? incoming
+      : crypto.randomUUID();
+  res.set("X-Request-Id", req.id);
+  next();
+});
 
-  page.on("dialog", async (dialog) => {
-    console.log(dialog.type());
-    console.log(dialog.message());
-    await dialog.accept();
+// HTTP request counter. We label only on the coarse route (not full URL) so
+// cardinality stays bounded even with user-supplied jobIds.
+app.use((req, res, next) => {
+  res.on("finish", () => {
+    const route = coarseRoute(req.path);
+    mHttpRequests.inc({
+      route,
+      method: req.method,
+      status: String(res.statusCode),
+    });
+  });
+  next();
+});
+
+function coarseRoute(p) {
+  if (p === "/screenshots") return "/screenshots";
+  if (p.startsWith("/screenshots/events/")) return "/screenshots/events/:id";
+  if (p.startsWith("/screenshots/")) return "/screenshots/:id";
+  if (p === "/metrics" || p === "/health" || p === "/docs") return p;
+  if (p.startsWith("/docs")) return "/docs";
+  return "other";
+}
+
+// Rate limit only capture submissions — SSE streams must stay cheap and
+// unthrottled; image GETs go direct to MinIO and never hit this process.
+const screenshotsRateLimiter = rateLimit({
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  max: RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (_req, res) => {
+    res
+      .status(429)
+      .set(
+        "Retry-After",
+        String(Math.ceil(RATE_LIMIT_WINDOW_MS / 1000))
+      )
+      .json({
+        error: "too many capture requests",
+        retryAfterSec: Math.ceil(RATE_LIMIT_WINDOW_MS / 1000),
+      });
+  },
+});
+
+app.use("/docs", swaggerUi.serve, swaggerUi.setup(swaggerDocs));
+
+/**
+ * @swagger
+ * /health:
+ *   get:
+ *     summary: Health check
+ *     responses:
+ *       200: { description: OK }
+ */
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok", uptime: process.uptime() });
+});
+
+/**
+ * @swagger
+ * /metrics:
+ *   get:
+ *     summary: Prometheus metrics (text/plain; version=0.0.4)
+ *     responses:
+ *       200: { description: Metrics snapshot }
+ */
+app.get("/metrics", (_req, res) => {
+  // Keep the active-jobs gauge in sync at scrape time so it reflects the
+  // process's latest view even if we somehow failed to decrement elsewhere.
+  mActiveJobs.set({}, activeJobCount);
+  res.set("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+  res.send(metrics.render());
+});
+
+// ---------- Job bus (in-memory pub/sub for SSE progress) ----------
+/**
+ * jobs: Map<jobId, {
+ *   emitter: EventEmitter,
+ *   buffer: Array<{type, ...payload}>,   // replay buffer for late subscribers
+ *   done: boolean,
+ *   createdAt: number,
+ * }>
+ *
+ * We keep a short replay buffer so a client connecting a moment after POST
+ * still receives the events it missed (network latency, React mount timing).
+ */
+const jobs = new Map();
+// Tracks outputFileNames that are currently being captured. Prevents two
+// concurrent jobs from writing to the same MinIO prefix — the second's
+// deletePrefix would wipe objects the first just uploaded.
+const activeOutputs = new Set();
+
+function createJob(outputFileName, requestId) {
+  const jobId = crypto.randomUUID();
+  const job = {
+    emitter: new EventEmitter(),
+    buffer: [],
+    done: false,
+    createdAt: Date.now(),
+    outputFileName,
+    requestId: requestId || null,
+    abortController: new AbortController(),
+    // "running" until a terminal event publishes. Used by DELETE to decide
+    // 409 vs. honoring the cancel.
+    status: "running",
+  };
+  // EventEmitter defaults to 10 listeners — a client may reconnect and briefly
+  // overlap listeners, so bump this a bit.
+  job.emitter.setMaxListeners(32);
+  jobs.set(jobId, job);
+  return { jobId, job };
+}
+
+function publishTo(job, event) {
+  // Stamp every outbound event with the job+request IDs so clients can
+  // correlate SSE messages with their original POST response.
+  const stamped = {
+    ...event,
+    requestId: job.requestId || undefined,
+  };
+  job.buffer.push(stamped);
+  job.emitter.emit("event", stamped);
+  if (
+    event.type === "done" ||
+    event.type === "error" ||
+    event.type === "cancelled"
+  ) {
+    job.done = true;
+    if (event.type === "cancelled") job.status = "cancelled";
+    else if (event.type === "error") job.status = "error";
+    else job.status = "done";
+    mJobsTotal.inc({ status: job.status });
+    job.emitter.emit("end");
+  }
+}
+
+// Periodically reap finished jobs so the map doesn't grow unbounded.
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, job] of jobs) {
+    if (job.done && now - job.createdAt > JOB_TTL_MS) {
+      jobs.delete(id);
+    }
+  }
+}, 60 * 1000).unref();
+
+// ---------- Capture pipeline ----------
+// Singleton browser: puppeteer.launch is ~1–2s, so we reuse across jobs.
+// Pages are still created/closed per capture to isolate crashes and leaks.
+const BROWSER_MAX_CAPTURES = Math.max(
+  1,
+  Number(process.env.BROWSER_MAX_CAPTURES || 500)
+);
+const BROWSER_MAX_AGE_MS = Math.max(
+  60_000,
+  Number(process.env.BROWSER_MAX_AGE_MS || 30 * 60 * 1000)
+);
+
+// Shape: { browser, startedAt, captures } | null
+let sharedBrowser = null;
+// Prevents a race when two jobs both decide to recycle at once.
+let recycleInFlight = null;
+// Set to true by the "between-jobs" check. Cleared once recycled.
+let retireRequested = false;
+// Tracks how many capture jobs are using the shared browser right now.
+let activeJobCount = 0;
+
+async function launchBrowser() {
+  const browser = await puppeteer.launch({
+    headless: true,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage", // avoid small /dev/shm in containers
+      "--disable-gpu",
+      "--disable-background-timer-throttling",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-renderer-backgrounding",
+    ],
+  });
+  browser.on("disconnected", () => {
+    // Only null out if this is still the current handle; a stale
+    // disconnect (from a browser we already swapped out) must not clobber
+    // the fresh one.
+    if (sharedBrowser && sharedBrowser.browser === browser) {
+      sharedBrowser = null;
+    }
+  });
+  sharedBrowser = { browser, startedAt: Date.now(), captures: 0 };
+  return browser;
+}
+
+async function recycleSharedBrowser(reason) {
+  if (recycleInFlight) return recycleInFlight;
+  const stale = sharedBrowser;
+  recycleInFlight = (async () => {
+    try {
+      log.info("browser recycling", { reason, captures: stale?.captures });
+      mBrowserRecycles.inc({ reason });
+      if (stale && stale.browser.isConnected()) {
+        await stale.browser.close().catch(() => {});
+      }
+      // Clear the slot so launchBrowser() installs a fresh handle.
+      sharedBrowser = null;
+      retireRequested = false;
+      return await launchBrowser();
+    } finally {
+      recycleInFlight = null;
+    }
+  })();
+  return recycleInFlight;
+}
+
+async function getSharedBrowser() {
+  if (recycleInFlight) {
+    return recycleInFlight;
+  }
+
+  if (
+    retireRequested &&
+    activeJobCount === 0 &&
+    sharedBrowser &&
+    sharedBrowser.browser.isConnected()
+  ) {
+    return recycleSharedBrowser("between-jobs");
+  }
+
+  if (sharedBrowser && sharedBrowser.browser.isConnected()) {
+    const age = Date.now() - sharedBrowser.startedAt;
+    const over =
+      sharedBrowser.captures >= BROWSER_MAX_CAPTURES ||
+      age >= BROWSER_MAX_AGE_MS;
+    if (over && activeJobCount === 0) {
+      return recycleSharedBrowser(
+        sharedBrowser.captures >= BROWSER_MAX_CAPTURES ? "captures" : "age"
+      );
+    }
+    if (over) {
+      retireRequested = true;
+    }
+    return sharedBrowser.browser;
+  }
+
+  return launchBrowser();
+}
+
+function markCaptureSuccess() {
+  if (sharedBrowser) sharedBrowser.captures++;
+}
+
+const BROWSER_UA =
+  process.env.WAYBACK_BROWSER_UA ||
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+async function configurePage(page, viewport) {
+  await page.setViewport(viewport);
+  await page.setUserAgent(BROWSER_UA);
+  await page.setCacheEnabled(false);
+
+  await page.setRequestInterception(true);
+  page.on("request", (req) => {
+    try {
+      const type = req.resourceType();
+      if (BLOCKED_RESOURCE_TYPES.has(type)) return req.abort();
+      if (BLOCK_HOSTS_RE.test(req.url())) return req.abort();
+      req.continue();
+    } catch {
+      // Request may already be handled if navigation was cancelled.
+    }
   });
 
-  let urls = await getURLs(
+  page.on("dialog", async (dialog) => {
+    try {
+      await dialog.accept();
+    } catch {
+      /* ignore */
+    }
+  });
+  page.on("pageerror", () => {});
+  page.on("error", () => {});
+}
+
+// Thrown when a job has been cancelled mid-flight. Distinct from normal
+// errors so the caller can skip publishing a capture:skip event.
+class CancelledError extends Error {
+  constructor() {
+    super("cancelled");
+    this.name = "CancelledError";
+  }
+}
+
+// Take a screenshot of `archiveUrl` and return the encoded image Buffer.
+// The caller is responsible for uploading it.
+async function captureOne(
+  browser,
+  archiveUrl,
+  viewport,
+  signal,
+  captureOptions = {}
+) {
+  const format = captureOptions.format === "jpeg" ? "jpeg" : "png";
+  const quality = Number.isInteger(captureOptions.quality)
+    ? captureOptions.quality
+    : 80;
+  if (signal && signal.aborted) throw new CancelledError();
+
+  const page = await browser.newPage();
+  const onAbort = () => {
+    page.close({ runBeforeUnload: false }).catch(() => {});
+  };
+  if (signal) signal.addEventListener("abort", onAbort, { once: true });
+
+  try {
+    await configurePage(page, viewport);
+
+    await page.goto(archiveUrl, {
+      timeout: NAV_TIMEOUT_MS,
+      waitUntil: "domcontentloaded",
+    });
+    if (signal && signal.aborted) throw new CancelledError();
+    await page
+      .waitForNetworkIdle({
+        idleTime: NETWORK_IDLE_MS,
+        timeout: NETWORK_IDLE_TIMEOUT_MS,
+      })
+      .catch(() => {
+        // Best-effort — if the page never idles, we still screenshot what's rendered.
+      });
+    if (signal && signal.aborted) throw new CancelledError();
+
+    // Strip Wayback toolbar. No waiting: if it's not in the DOM now, it won't be.
+    await page
+      .evaluate(() => {
+        const el = document.getElementById("wm-ipp-base");
+        if (el && el.parentNode) el.parentNode.removeChild(el);
+      })
+      .catch(() => {});
+
+    const screenshotArgs = { type: format };
+    if (format === "jpeg") {
+      screenshotArgs.quality = quality;
+    }
+    // Returns a Buffer when no `path` is provided.
+    return await page.screenshot(screenshotArgs);
+  } finally {
+    if (signal) signal.removeEventListener("abort", onAbort);
+    await page.close({ runBeforeUnload: false }).catch(() => {});
+  }
+}
+
+function frameKey(outputFileName, index, ext) {
+  return `${outputFileName}/${index}.${ext}`;
+}
+
+function gifKey(outputFileName) {
+  return `${outputFileName}/${outputFileName}.gif`;
+}
+
+function contentTypeFor(format) {
+  return format === "jpeg" ? "image/jpeg" : "image/png";
+}
+
+async function run(
+  url,
+  startYear,
+  endYear,
+  outputFileName,
+  publish,
+  signal,
+  options = {},
+  gifEncoder = null
+) {
+  const maxNumberOfCaptures = 300;
+  const collapse = "timestamp:6";
+  const viewport = { width: 1366, height: 1366 };
+  const format = options.format === "jpeg" ? "jpeg" : "png";
+  const quality = Number.isInteger(options.quality) ? options.quality : 80;
+  const ext = format === "jpeg" ? "jpg" : "png";
+  const contentType = contentTypeFor(format);
+  const isAborted = () => signal && signal.aborted;
+
+  // Wipe any prior objects for this outputFileName so a rebuild starts
+  // clean (otherwise indices beyond the new count would linger as
+  // orphans from the previous run).
+  await storage.deletePrefix(`${outputFileName}/`);
+
+  if (isAborted()) throw new CancelledError();
+
+  publish({ type: "phase", phase: "fetching-urls" });
+
+  const urls = await getURLs(
     url,
     maxNumberOfCaptures,
     startYear,
     endYear,
     collapse
   );
-  console.log("urls", urls);
-
-  let count = startIndex;
-  console.assert(
-    startIndex < urls.length,
-    "startIndex is greater than the number of urls"
-  );
-
-  if (!fs.existsSync(screenshotFolderName)) {
-    console.log(`Creating folder ${screenshotFolderName}`);
-    fs.mkdirSync(screenshotFolderName);
-  } else {
-    console.log(`Deleting folder ${screenshotFolderName}`);
-    exec(`rm -rf ${screenshotFolderName}`, (err, stdout, stderr) => {
-      if (err) {
-        console.log(`Error deleting folder ${screenshotFolderName}`);
-        return;
-      }
-      console.log(`Deleted folder ${screenshotFolderName}`);
-      fs.mkdirSync(screenshotFolderName);
+  if (isAborted()) throw new CancelledError();
+  if (!urls || urls.length === 0) {
+    throw Object.assign(new Error("no snapshots found for this URL/range"), {
+      status: 404,
     });
   }
 
-  let metaDataPath = `${screenshotFolderName}/imageInfo-${screenshotFolderName}.txt`;
-
-  if (fs.existsSync(metaDataPath)) {
-    fs.unlinkSync(metaDataPath);
-  } else {
-    console.log(`Creating file ${metaDataPath}`);
-    fs.writeFileSync(metaDataPath, "");
-  }
-
-  for (let url of urls.slice(startIndex)) {
-    try {
-      await takeScreenshotOfPage(
-        url,
-        browser,
-        page,
-        count,
-        screenshotFolderName
-      );
-      let timestamp = url.split("/")[4];
-      fs.appendFileSync(metaDataPath, `${url} ${count} ${timestamp}` + "\n");
-      count++;
-    } catch (e) {
-      console.log(e);
-    }
-  }
-
-  browser.close();
-}
-
-async function createGifFromScreenshots(screenshotFolderName, outputFileName) {
-  const files = await readdirAsync(screenshotFolderName);
-  const pngFiles = files.filter(file => file.endsWith('.png'));
-
-  if (pngFiles.length === 0) {
-    throw new Error('No PNG files found in the directory');
-  }
-
-  const [width, height] = await new Promise(resolve => {
-    const image = new Image();
-    image.onload = () => resolve([image.width, image.height]);
-    image.src = path.join(screenshotFolderName, pngFiles[0]);
+  publish({ type: "urls", total: urls.length });
+  publish({
+    type: "phase",
+    phase: "capturing",
+    concurrency: Math.min(CAPTURE_CONCURRENCY, urls.length),
   });
 
-  const gifPath = path.join(screenshotFolderName, `${outputFileName}.gif`);
-  const writeStream = createWriteStream(gifPath);
+  const browser = await getSharedBrowser();
 
-  const encoder = new GIFEncoder(width, height, 'neuquant');
-  encoder.createReadStream().pipe(writeStream);
-  encoder.start();
-  encoder.setDelay(500); // frame delay in ms
+  // Accumulate image URLs in index order for the final "done" event +
+  // cache manifest. Workers write via index so order is preserved.
+  const imageUrls = new Array(urls.length).fill(null);
 
-  const canvas = createCanvas(width, height);
-  const ctx = canvas.getContext('2d');
+  let nextIndex = 0;
+  let successCount = 0;
+  const total = urls.length;
+  const effectiveConcurrency = Math.min(CAPTURE_CONCURRENCY, total);
 
-  for (const file of pngFiles) {
-    await new Promise(resolve => {
-      const image = new Image();
-      image.onload = () => {
-        ctx.drawImage(image, 0, 0);
-        encoder.addFrame(ctx);
-        resolve();
-      };
-      image.src = path.join(screenshotFolderName, file);
-    });
-  }
+  const worker = async () => {
+    while (true) {
+      if (isAborted()) return;
+      const index = nextIndex++;
+      if (index >= total) return;
 
-  encoder.finish();
-  return gifPath;
+      const archiveUrl = urls[index];
+      const timestamp = archiveUrl.split("/")[4];
+
+      publish({
+        type: "capture:start",
+        index,
+        total,
+        url: archiveUrl,
+        timestamp,
+      });
+
+      // One bounded retry on capture + upload — a transient Wayback 503 or
+      // a brief MinIO blip shouldn't mark the frame as skipped.
+      let lastErr = null;
+      let buf = null;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          buf = await captureOne(
+            browser,
+            archiveUrl,
+            viewport,
+            signal,
+            { format, quality }
+          );
+          try {
+            await storage.putObject(
+              frameKey(outputFileName, index, ext),
+              buf,
+              contentType
+            );
+            mUploadsTotal.inc({ kind: "frame" });
+          } catch (uploadErr) {
+            mUploadErrors.inc({ kind: "frame" });
+            throw uploadErr;
+          }
+          lastErr = null;
+          break;
+        } catch (e) {
+          if (e instanceof CancelledError || isAborted()) {
+            return;
+          }
+          lastErr = e;
+        }
+      }
+
+      if (isAborted()) return;
+
+      if (lastErr) {
+        log.warn("capture: skip", { url: archiveUrl, err: lastErr.message });
+        mCapturesSkippedTotal.inc();
+        publish({
+          type: "capture:skip",
+          index,
+          total,
+          url: archiveUrl,
+          timestamp,
+          reason: lastErr.message,
+        });
+        // Let the streaming GIF encoder advance past this gap.
+        if (gifEncoder) gifEncoder.onSkip(index);
+        continue;
+      }
+
+      successCount++;
+      markCaptureSuccess();
+      mCapturesTotal.inc();
+
+      const publicUrl = storage.buildPublicUrl(
+        frameKey(outputFileName, index, ext)
+      );
+      imageUrls[index] = publicUrl;
+      publish({
+        type: "capture:done",
+        index,
+        total,
+        url: archiveUrl,
+        timestamp,
+        imageUrl: publicUrl,
+        fileIndex: index,
+      });
+      // Feed the streaming encoder with the in-memory buffer — no extra
+      // read needed since we already have it from page.screenshot().
+      if (gifEncoder) {
+        gifEncoder.onFrame(index, buf);
+      }
+    }
+  };
+
+  const workers = Array.from({ length: effectiveConcurrency }, () => worker());
+  await Promise.all(workers);
+
+  if (isAborted()) throw new CancelledError();
+
+  return {
+    count: successCount,
+    images: imageUrls.filter(Boolean),
+  };
 }
 
-
-app.get("/folders", async (req, res) => {
-
- const folders =  cloudflarestorage.listFolders;
-
- console.log(folders);
-})
-
+// ---------- Routes ----------
 /**
  * @swagger
  * /screenshots:
  *   post:
- *     summary: Generate screenshots and return image paths
+ *     summary: Start a Wayback capture job; returns a jobId to subscribe to
+ *     description: |
+ *       Launches the capture asynchronously and returns immediately with a
+ *       `jobId`. Subscribe to `/screenshots/events/{jobId}` (SSE) for live
+ *       progress events, ending with a `done` event that carries the full
+ *       image list. Images are stored in MinIO and returned as direct URLs.
  *     requestBody:
  *       required: true
  *       content:
  *         application/json:
  *           schema:
  *             type: object
+ *             required: [url, startYear, endYear, outputFileName]
  *             properties:
- *               url:
- *                 type: string
- *                 description: The URL to capture screenshots from
- *               startYear:
- *                 type: integer
- *                 description: The start year for capturing screenshots
- *               endYear:
- *                 type: integer
- *                 description: The end year for capturing screenshots
- *               outputFileName:
- *                 type: string
- *                 description: The base name for output files
+ *               url: { type: string }
+ *               startYear: { type: integer }
+ *               endYear: { type: integer }
+ *               outputFileName: { type: string }
+ *               format: { type: string, enum: [png, jpeg], default: png }
+ *               quality: { type: integer, minimum: 1, maximum: 100, default: 80 }
+ *     responses:
+ *       202: { description: Job accepted, returns { jobId } }
+ *       400: { description: Invalid parameters }
+ */
+app.post("/screenshots", screenshotsRateLimiter, async (req, res) => {
+  // Concurrency cap — independent from rate limit. Protects Puppeteer RSS.
+  if (activeJobCount >= MAX_ACTIVE_JOBS) {
+    res.set(
+      "Retry-After",
+      String(Math.ceil(RATE_LIMIT_WINDOW_MS / 1000))
+    );
+    return res.status(429).json({
+      error: "server busy, try again shortly",
+      activeJobs: activeJobCount,
+      maxActiveJobs: MAX_ACTIVE_JOBS,
+      retryAfterSec: Math.ceil(RATE_LIMIT_WINDOW_MS / 1000),
+    });
+  }
+
+  const {
+    url,
+    startYear,
+    endYear,
+    outputFileName,
+    format: rawFormat,
+    quality: rawQuality,
+  } = req.body || {};
+
+  const errs = [];
+  if (typeof url !== "string" || !/^https?:\/\//i.test(url))
+    errs.push("url must be a valid http(s) URL");
+  const sy = Number(startYear);
+  const ey = Number(endYear);
+  if (!Number.isInteger(sy) || sy < 1900) errs.push("startYear invalid");
+  if (!Number.isInteger(ey) || ey < 1900) errs.push("endYear invalid");
+  if (Number.isInteger(sy) && Number.isInteger(ey) && sy > ey)
+    errs.push("startYear must be <= endYear");
+  if (typeof outputFileName !== "string" || !SAFE_NAME_RE.test(outputFileName))
+    errs.push(
+      "outputFileName must match [A-Za-z0-9_-]{1,64} (no spaces or slashes)"
+    );
+
+  // Optional format/quality. Defaults preserve pre-#21 behavior (PNG).
+  let format = "png";
+  if (rawFormat !== undefined) {
+    if (rawFormat === "png" || rawFormat === "jpeg") {
+      format = rawFormat;
+    } else {
+      errs.push('format must be "png" or "jpeg"');
+    }
+  }
+  let quality = 80;
+  if (rawQuality !== undefined) {
+    const q = Number(rawQuality);
+    if (!Number.isInteger(q) || q < 1 || q > 100) {
+      errs.push("quality must be an integer between 1 and 100");
+    } else {
+      quality = q;
+    }
+  }
+
+  if (errs.length) {
+    return res.status(400).json({ error: "invalid parameters", details: errs });
+  }
+
+  // Reject duplicate in-flight jobs for the same output name — otherwise the
+  // second job's deletePrefix() would wipe objects the first is uploading.
+  if (activeOutputs.has(outputFileName)) {
+    return res.status(409).json({
+      error: "a capture is already running for this outputFileName",
+    });
+  }
+
+  // Cache lookup. Key is derived from (url, range, format, quality) — the
+  // outputFileName is a display label and is NOT part of the key. A hit
+  // returns immediately with the cached image URLs.
+  const hitKey = resultCache.key({
+    url,
+    startYear: sy,
+    endYear: ey,
+    format,
+    quality,
+  });
+  const hit = resultCache.enabled ? await resultCache.lookup(hitKey) : null;
+
+  const { jobId, job } = createJob(outputFileName, req.id);
+  activeOutputs.add(outputFileName);
+  const publish = (event) => publishTo(job, event);
+  const jobLog = log.child({ requestId: req.id, jobId });
+  jobLog.info("capture requested", {
+    url,
+    startYear: sy,
+    endYear: ey,
+    format,
+    quality,
+  });
+
+  if (hit && Array.isArray(hit.images) && hit.images.length > 0) {
+    mCacheHits.inc();
+    res.status(202).json({
+      jobId,
+      cached: true,
+      streamUrl: `${PUBLIC_BASE_URL}/screenshots/events/${jobId}`,
+    });
+    publish({
+      type: "done",
+      images: hit.images,
+      gif: hit.gifUrl || null,
+      count: hit.count || hit.images.length,
+      cached: true,
+    });
+    jobLog.info("cache hit", { images: hit.images.length });
+    activeOutputs.delete(outputFileName);
+    return;
+  }
+
+  if (resultCache.enabled) mCacheMisses.inc();
+
+  // Return the jobId immediately — the rest happens in the background.
+  res.status(202).json({
+    jobId,
+    streamUrl: `${PUBLIC_BASE_URL}/screenshots/events/${jobId}`,
+  });
+
+  // Fire-and-forget background task. All errors are pushed through the bus.
+  (async () => {
+    publish({ type: "phase", phase: "starting" });
+    const signal = job.abortController.signal;
+    activeJobCount++;
+    // Streaming GIF encoder — encodes frames as they're captured, overlapping
+    // work with Puppeteer so the encoding tail at the end is ~0.
+    const gifEncoder = createStreamingGifEncoder({});
+    try {
+      const { count, images } = await run(
+        url,
+        sy,
+        ey,
+        outputFileName,
+        publish,
+        signal,
+        { format, quality },
+        gifEncoder
+      );
+
+      if (signal.aborted) throw new CancelledError();
+
+      // Drain remaining buffered frames, close the GIF stream, upload.
+      publish({ type: "phase", phase: "encoding-gif" });
+      let gifUrl = null;
+      try {
+        const { gifBuffer, framesEncoded } = await gifEncoder.finish();
+        if (gifBuffer && framesEncoded > 0) {
+          const gKey = gifKey(outputFileName);
+          try {
+            await storage.putObject(gKey, gifBuffer, "image/gif");
+            mUploadsTotal.inc({ kind: "gif" });
+            gifUrl = storage.buildPublicUrl(gKey);
+            publish({ type: "gif", url: gifUrl });
+          } catch (e) {
+            mUploadErrors.inc({ kind: "gif" });
+            throw e;
+          }
+        } else {
+          publish({ type: "gif:failed", reason: "no frames encoded" });
+        }
+      } catch (e) {
+        jobLog.warn("gif encode failed", { err: e.message });
+        publish({ type: "gif:failed", reason: e.message });
+      }
+
+      publish({ type: "done", images, gif: gifUrl, count });
+      // Record cache entry only on genuine success (at least one image).
+      if (resultCache.enabled && images.length > 0) {
+        await resultCache.record(hitKey, {
+          outputFileName,
+          images,
+          gifUrl,
+          count,
+        });
+      }
+    } catch (err) {
+      if (err instanceof CancelledError || signal.aborted) {
+        // Abort the streaming encoder so the buffered partial GIF is dropped.
+        await gifEncoder.abort().catch(() => {});
+        // Wipe partial uploads so a retry with the same outputFileName starts
+        // clean and orphan objects don't linger in MinIO.
+        await storage
+          .deletePrefix(`${outputFileName}/`)
+          .catch(() => {});
+        jobLog.info("job cancelled", { outputFileName });
+        publish({ type: "cancelled" });
+      } else {
+        await gifEncoder.abort().catch(() => {});
+        jobLog.error("job failed", {
+          err: err.message,
+          status: (err && err.status) || 500,
+        });
+        publish({
+          type: "error",
+          message: err.message || "internal error",
+          status: (err && err.status) || 500,
+          upstreamStatus: (err && err.upstreamStatus) || undefined,
+        });
+      }
+    } finally {
+      activeOutputs.delete(outputFileName);
+      activeJobCount = Math.max(0, activeJobCount - 1);
+    }
+  })();
+});
+
+/**
+ * @swagger
+ * /screenshots/{jobId}:
+ *   delete:
+ *     summary: Cancel an in-flight capture job
+ *     parameters:
+ *       - in: path
+ *         name: jobId
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       202: { description: Cancellation requested }
+ *       404: { description: Unknown jobId }
+ *       409: { description: Job already finished }
+ */
+app.delete("/screenshots/:jobId", (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: "unknown job" });
+  if (job.done) {
+    return res
+      .status(409)
+      .json({ error: "job already finished", status: job.status });
+  }
+  job.abortController.abort();
+  res.status(202).json({ status: "cancelling" });
+});
+
+/**
+ * @swagger
+ * /screenshots/events/{jobId}:
+ *   get:
+ *     summary: SSE stream of progress events for a capture job
+ *     parameters:
+ *       - in: path
+ *         name: jobId
+ *         required: true
+ *         schema: { type: string }
  *     responses:
  *       200:
- *         description: A list of image paths
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 images:
- *                   type: array
- *                   items:
- *                     type: string
- *       400:
- *         description: Missing required parameters
- *       404:
- *         description: No images found
- *       500:
- *         description: An error occurred while taking screenshots or creating GIF
+ *         description: text/event-stream
+ *       404: { description: Unknown jobId }
  */
-app.post("/screenshots", async (req, res) => {
-  const { url, startYear, endYear, outputFileName } = req.body;
-
-  if (!url || !startYear || !endYear || !outputFileName) {
-    return res.status(400).send("Missing required parameters");
+app.get("/screenshots/events/:jobId", (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ error: "unknown job" });
   }
 
-  try {
-    // await run(url, startYear, endYear, outputFileName);
-    // console.log(outputFileName);
-    // const gifPath = await createGifFromScreenshots(`screenshots-${outputFileName}`, outputFileName);
-    // const absoluteGifPath = path.resolve(gifPath);
-    // res.status(200).sendFile(absoluteGifPath);
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  res.flushHeaders?.();
 
-    console.log(outputFileName);
-    const screenshotFolderName = `screenshots-${outputFileName}`;
-    const files = await readdirAsync(screenshotFolderName);
-    const pngFiles = files.filter(file => file.endsWith('.png'));
-
-    if (pngFiles.length === 0) {
-      return res.status(404).send("No images found");
+  let cleanedUp = false;
+  const send = (event) => {
+    if (cleanedUp || res.writableEnded) return;
+    try {
+      res.write(`data: ${JSON.stringify(event)}\n\n`);
+    } catch {
+      // socket already torn down — cleanup will happen via 'close'
     }
+  };
 
-    const imagePaths = pngFiles.map(file => path.resolve(screenshotFolderName, file));
-    res.status(200).json({ images: imagePaths });
+  // Replay everything the job has produced so far.
+  for (const event of job.buffer) send(event);
 
-
-  } catch (error) {
-    console.error(error);
-    res.status(500).send("An error occurred while taking screenshots or creating GIF");
+  if (job.done) {
+    res.end();
+    return;
   }
+
+  const onEvent = (event) => send(event);
+  const onEnd = () => {
+    if (!res.writableEnded) res.end();
+  };
+  job.emitter.on("event", onEvent);
+  job.emitter.once("end", onEnd);
+
+  const heartbeat = setInterval(() => {
+    if (cleanedUp || res.writableEnded) return;
+    try {
+      res.write(`: ping\n\n`);
+    } catch {
+      /* ignore */
+    }
+  }, 15000);
+
+  const cleanup = () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    clearInterval(heartbeat);
+    job.emitter.off("event", onEvent);
+    job.emitter.off("end", onEnd);
+  };
+
+  req.on("close", cleanup);
+  res.on("close", cleanup);
+  res.on("error", cleanup);
 });
 
-app.get("/test", (req, res) => {
-  res.send({ date: "This is returned from server" });
+// ---------- 404 fallback ----------
+app.use((_req, res) => {
+  res.status(404).json({ error: "not found" });
 });
 
-app.listen(port, () => {
-  console.log(`Server is running on ${port}`);
+// ---------- Error handler ----------
+// eslint-disable-next-line no-unused-vars
+app.use((err, _req, res, _next) => {
+  console.error(err);
+  res.status(500).json({ error: "internal error" });
 });
+
+const server = app.listen(PORT, () => {
+  console.log(`Server listening on ${PUBLIC_BASE_URL}`);
+  console.log(`Docs: ${PUBLIC_BASE_URL}/docs`);
+  console.log(
+    `Capture concurrency: ${CAPTURE_CONCURRENCY} · nav timeout: ${NAV_TIMEOUT_MS}ms`
+  );
+
+  // Best-effort bucket bootstrap. If MinIO isn't up yet, /health still
+  // works and the first capture will retry; log and move on.
+  storage.ensureBucket().catch((err) => {
+    log.warn("storage: ensureBucket failed (will retry on first upload)", {
+      err: err.message,
+    });
+  });
+});
+
+// Graceful shutdown: close the shared Puppeteer browser and HTTP server.
+async function shutdown(signal) {
+  console.log(`\n${signal} received — shutting down`);
+  server.close();
+  if (sharedBrowser) {
+    try {
+      await sharedBrowser.browser.close();
+    } catch {
+      /* ignore */
+    }
+  }
+  process.exit(0);
+}
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
