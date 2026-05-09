@@ -32,12 +32,23 @@ function normalizeUrl(url) {
   }
 }
 
+// Bump when the capture pipeline produces materially different output
+// for the same (url, years, format) tuple — that way old manifests are
+// effectively invalidated without having to walk MinIO and delete them.
+//
+//   v1 — initial, monthly captures (`collapse=timestamp:6`) with no
+//        consecutive-duplicate filtering
+//   v2 — monthly captures deduped by HTML digest (see util/wayback.js
+//        convertToPublicUrls)
+const CAPTURE_ALGO_VERSION = "v2";
+
 function cacheKey({ url, startYear, endYear, format, quality }) {
   const payload = [
     normalizeUrl(url),
     Number(startYear),
     Number(endYear),
     format === "jpeg" ? `jpeg:${Number(quality)}` : "png",
+    CAPTURE_ALGO_VERSION,
   ].join("|");
   return crypto.createHash("sha256").update(payload).digest("hex");
 }
@@ -55,6 +66,7 @@ function createCache({ storage }) {
       },
       async record() {},
       async invalidate() {},
+      async patchSummary() {},
       key: cacheKey,
     };
   }
@@ -76,25 +88,74 @@ function createCache({ storage }) {
     }
   }
 
+  async function writeManifest(key, payload) {
+    await storage.putObject(
+      objectKey(key),
+      Buffer.from(JSON.stringify(payload)),
+      "application/json",
+      // Cache manifests are tiny and change as new jobs finish — don't
+      // let browsers/CDNs pin an old one.
+      { cacheControl: "no-cache" }
+    );
+  }
+
   async function record(key, entry) {
     const payload = {
       outputFileName: entry.outputFileName,
       images: entry.images || [],
+      // Wayback timestamps aligned 1:1 with images. Older manifests
+      // predate this field and will simply return undefined — the client
+      // degrades to "approximate year" labels in that case.
+      timestamps: entry.timestamps || [],
+      // AI-generated captions aligned 1:1 with images. Sparse on fresh
+      // captures (summaries are lazy) — slots default to empty string
+      // and get filled in via patchSummary() as the client requests
+      // them. Cache hits return whatever's been accumulated so far.
+      summaries: entry.summaries || new Array(entry.images?.length || 0).fill(""),
       gifUrl: entry.gifUrl || null,
       count: entry.count || 0,
       createdAt: Date.now(),
     };
     try {
-      await storage.putObject(
-        objectKey(key),
-        Buffer.from(JSON.stringify(payload)),
-        "application/json",
-        // Cache manifests are tiny and change as new jobs finish — don't
-        // let browsers/CDNs pin an old one.
-        { cacheControl: "no-cache" }
-      );
+      await writeManifest(key, payload);
     } catch (err) {
       log.warn("cache: record failed", { key, err: err.message });
+    }
+  }
+
+  /**
+   * Insert a summary at `index` in the manifest for `key`. Read-modify-
+   * write; there's no S3 optimistic concurrency for this path, but
+   * summaries are idempotent — a later overwrite from a concurrent
+   * request simply replaces a string with another string. Tolerable.
+   */
+  async function patchSummary(key, index, summary) {
+    try {
+      const entry = await storage.getObjectJSON(objectKey(key));
+      if (!entry) {
+        // Cache entry disappeared (e.g. invalidated between capture and
+        // summary request). Nothing to patch — caller still gets the
+        // summary in the HTTP response.
+        return;
+      }
+      const images = Array.isArray(entry.images) ? entry.images : [];
+      if (!Number.isInteger(index) || index < 0 || index >= images.length) {
+        return;
+      }
+      const summaries = Array.isArray(entry.summaries)
+        ? entry.summaries.slice()
+        : new Array(images.length).fill("");
+      // Pad older manifests where summaries was shorter than images.
+      while (summaries.length < images.length) summaries.push("");
+      summaries[index] = summary;
+      entry.summaries = summaries;
+      await writeManifest(key, entry);
+    } catch (err) {
+      log.warn("cache: patchSummary failed", {
+        key,
+        index,
+        err: err.message,
+      });
     }
   }
 
@@ -103,6 +164,7 @@ function createCache({ storage }) {
     lookup,
     record,
     invalidate,
+    patchSummary,
     key: cacheKey,
   };
 }

@@ -104,11 +104,16 @@ function setPayload(url, limit, startYear, stopYear, collapse) {
   // CDX accepts multiple `filter=` params — skip dead captures + non-HTML
   // mimetypes (images, PDFs, redirects) upstream so we don't waste Puppeteer
   // time on them. `!` prefix = negation in CDX filter syntax.
+  //
+  // `digest` is the SHA-1 of the raw HTML response body. We pull it so we
+  // can dedupe consecutive monthly snapshots whose content didn't change —
+  // otherwise a site that stayed static for two years would produce 24
+  // near-identical screenshots, one per month.
   return {
     url,
     limit,
     output: "json",
-    fl: "timestamp,original",
+    fl: "timestamp,original,digest",
     from: startYear,
     to: stopYear,
     collapse,
@@ -116,12 +121,30 @@ function setPayload(url, limit, startYear, stopYear, collapse) {
   };
 }
 
+/**
+ * Turn CDX JSON rows into public archive URLs, dropping rows whose HTML
+ * digest matches the immediately-preceding row. The CDX API supports
+ * `collapse=digest` in theory, but stacking it with `collapse=timestamp:6`
+ * has inconsistent behaviour across archive.org edges — doing the dedupe
+ * locally is deterministic and cheap (rows are already ordered by time).
+ *
+ * Only *consecutive* duplicates are collapsed. If a site reverts to a
+ * previous design after a redesign, both eras still get represented.
+ */
 function convertToPublicUrls(rows) {
-  if (!Array.isArray(rows) || rows.length === 0) return [];
-  // First row is the header (["timestamp","original"]) — drop it
-  return rows.slice(1).map(([timestamp, original]) => {
-    return `https://web.archive.org/web/${timestamp}/${original}`;
-  });
+  if (!Array.isArray(rows) || rows.length <= 1) return [];
+  // First row is the header (["timestamp","original","digest"]) — drop it
+  const data = rows.slice(1);
+  const out = [];
+  let prevDigest = null;
+  for (const [timestamp, original, digest] of data) {
+    // Empty/missing digest? Treat as "different" so we don't collapse
+    // capture rows with unknown content identity.
+    if (digest && digest === prevDigest) continue;
+    prevDigest = digest || null;
+    out.push(`https://web.archive.org/web/${timestamp}/${original}`);
+  }
+  return out;
 }
 
 async function getURLs(url, limit, startYear, stopYear, collapse) {

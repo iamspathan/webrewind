@@ -7,9 +7,12 @@ import * as z from "zod";
 import { motion, AnimatePresence } from "framer-motion";
 import { Film, Play, AlertCircle } from "lucide-react";
 
-import { CinematicStage } from "@/components/evolution/CinematicStage";
+import { InteractiveTimeline } from "@/components/evolution/InteractiveTimeline";
 import { CaptureProgress } from "@/components/evolution/CaptureProgress";
-import { buildFrames } from "@/components/evolution/types";
+import {
+  buildFrames,
+  buildFramesFromManifest,
+} from "@/components/evolution/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -33,13 +36,6 @@ const formSchema = z
     url: z.string().url({ message: "Please enter a valid URL" }),
     startYear: z.number().min(1900).max(new Date().getFullYear()),
     endYear: z.number().min(1900).max(new Date().getFullYear()),
-    outputFileName: z
-      .string()
-      .min(1, { message: "Output file name is required" })
-      .max(255)
-      .regex(/^[A-Za-z0-9_-]+$/, {
-        message: "Letters, numbers, dashes and underscores only",
-      }),
     // On → PNG (default, lossless but large).
     // Off → JPEG q=80 (~10× smaller, slight compression artifacts).
     highQuality: z.boolean().default(true),
@@ -64,8 +60,9 @@ const API_BASE_URL =
   ) || "";
 
 // Where images actually live. Server uploads to MinIO under
-// <bucket>/<outputFileName>/<i>.png; preview/demo modes build the same
-// URL directly so they don't need a live capture.
+// <bucket>/<prefix>/<i>.png, where <prefix> is either a caller-supplied
+// outputFileName or a cache-key-derived slug. Preview/demo modes build
+// the same URL directly so they don't need a live capture.
 const IMAGES_BASE_URL = (
   (import.meta.env.VITE_IMAGES_BASE_URL as string | undefined) ||
   "http://localhost:9000/webrewind"
@@ -74,15 +71,15 @@ const IMAGES_BASE_URL = (
 /**
  * Optional preview mode for inspecting an already-captured folder without
  * re-running the pipeline. Activated via URL params, e.g.:
- *   /?preview=apyhub7&count=6&from=2019&to=2025&url=apyhub.com
- * Images are fetched directly from MinIO at <bucket>/<name>/<n>.png.
+ *   /?preview=<folder-name>&count=6&from=2019&to=2025&url=<host>
+ * Images are fetched directly from MinIO at <bucket>/<name>/<n>.png —
+ * the folder must already exist there from a prior capture.
  */
 function readPreviewConfig(): {
   images: string[];
   startYear: number;
   endYear: number;
   url: string;
-  outputFileName: string;
 } | null {
   if (typeof window === "undefined") return null;
   const params = new URLSearchParams(window.location.search);
@@ -101,7 +98,7 @@ function readPreviewConfig(): {
     (_, i) => `${IMAGES_BASE_URL}/${name}/${i}.png`
   );
 
-  return { images, startYear, endYear, url, outputFileName: name };
+  return { images, startYear, endYear, url };
 }
 
 function clampInt(
@@ -119,6 +116,23 @@ export default function WebsiteEvolutionViewer() {
   const [isLoading, setIsLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [evolutionImages, setEvolutionImages] = useState<string[]>([]);
+  // Wayback timestamps aligned 1:1 with evolutionImages. Empty when the
+  // server didn't provide them (older cache entries) — the timeline
+  // falls back to linearly-interpolated year labels in that case.
+  const [finalTimestamps, setFinalTimestamps] = useState<string[]>([]);
+  // AI captions aligned 1:1 with evolutionImages. Empty strings for
+  // slots the server hasn't summarized yet — MilestoneCards fill them
+  // in via /summaries as the user scrolls.
+  const [finalSummaries, setFinalSummaries] = useState<string[]>([]);
+  // Opaque manifest key (sha256) surfaced by the server's `done` SSE.
+  // Required by /summaries so captions can be patched back into the
+  // cache. Null disables captioning (older manifests, preview-mode
+  // responses).
+  const [finalCacheKey, setFinalCacheKey] = useState<string | null>(null);
+  // URL of the encoded GIF that the server emits on `done`. Shown as a
+  // finale block at the end of the timeline once the user scrolls past
+  // every snapshot. Null in preview mode / older responses.
+  const [finalGifUrl, setFinalGifUrl] = useState<string | null>(null);
   const [stageOpen, setStageOpen] = useState(false);
   const [submittedValues, setSubmittedValues] = useState<FormValues | null>(
     null
@@ -171,7 +185,6 @@ export default function WebsiteEvolutionViewer() {
       url: cfg.url,
       startYear: cfg.startYear,
       endYear: cfg.endYear,
-      outputFileName: cfg.outputFileName,
       highQuality: true,
     });
     setStageOpen(true);
@@ -183,29 +196,11 @@ export default function WebsiteEvolutionViewer() {
       url: "",
       startYear: currentYear - 5,
       endYear: currentYear,
-      outputFileName: "website_evolution",
       highQuality: true,
     },
   });
 
   const watchedValues = form.watch();
-
-  const openApyhubPreview = () => {
-    const now = new Date().getFullYear();
-    const images = Array.from(
-      { length: 6 },
-      (_, i) => `${IMAGES_BASE_URL}/apyhub7/${i}.png`
-    );
-    setEvolutionImages(images);
-    setSubmittedValues({
-      url: "https://apyhub.com",
-      startYear: now - 5,
-      endYear: now,
-      outputFileName: "apyhub7",
-      highQuality: true,
-    });
-    setStageOpen(true);
-  };
 
   const onSubmit = async (values: FormValues) => {
     // Close any leftover stream from a previous submission.
@@ -345,6 +340,9 @@ export default function WebsiteEvolutionViewer() {
           phase?: string;
           imageUrl?: string;
           timestamp?: string;
+          timestamps?: string[];
+          summaries?: string[];
+          cacheKey?: string | null;
         };
         try {
           msg = JSON.parse(ev.data);
@@ -393,6 +391,42 @@ export default function WebsiteEvolutionViewer() {
               setFinalizing(true);
               setPhase(null);
               setEvolutionImages(msg.images);
+              // Prefer the server's timestamps array (fresh capture +
+              // new cache manifests). Fall back to aligning with our
+              // live capturedFrames state if the server didn't send one
+              // — its `capture:done` events already carried per-frame
+              // timestamps, and the array is kept sorted by index.
+              if (
+                Array.isArray(msg.timestamps) &&
+                msg.timestamps.length === msg.images.length
+              ) {
+                setFinalTimestamps(msg.timestamps as string[]);
+              } else if (capturedFrames.length === msg.images.length) {
+                setFinalTimestamps(
+                  capturedFrames.map((f) => f.timestamp ?? "")
+                );
+              } else {
+                setFinalTimestamps([]);
+              }
+              // Captions: prefer whatever the server sent (cache hits
+              // carry accumulated captions; fresh captures send an
+              // empty array of the right length).
+              if (
+                Array.isArray(msg.summaries) &&
+                msg.summaries.length === msg.images.length
+              ) {
+                setFinalSummaries(msg.summaries as string[]);
+              } else {
+                setFinalSummaries(new Array(msg.images.length).fill(""));
+              }
+              // Older manifests (no cacheKey in the response) => null,
+              // which disables caption fetching in the UI.
+              setFinalCacheKey(
+                typeof msg.cacheKey === "string" && msg.cacheKey
+                  ? msg.cacheKey
+                  : null
+              );
+              setFinalGifUrl(typeof msg.gif === "string" ? msg.gif : null);
               finalizeTimerRef.current = setTimeout(() => {
                 if (!mountedRef.current) return;
                 setStageOpen(true);
@@ -685,26 +719,6 @@ export default function WebsiteEvolutionViewer() {
 
               <FormField
                 control={form.control}
-                name="outputFileName"
-                render={({ field }) => (
-                  <FormItem className="space-y-1.5">
-                    <FormLabel className="text-[10px] uppercase tracking-[0.3em] opacity-70 font-serif">
-                      Output name
-                    </FormLabel>
-                    <FormControl>
-                      <Input
-                        placeholder="website_evolution"
-                        className="h-11 bg-transparent border-[rgba(139,106,61,0.4)] focus-visible:ring-[var(--reel-amber)]/50 focus-visible:border-[var(--reel-amber)]/70 font-serif"
-                        {...field}
-                      />
-                    </FormControl>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-
-              <FormField
-                control={form.control}
                 name="highQuality"
                 render={({ field }) => (
                   <FormItem className="flex items-center gap-3">
@@ -735,15 +749,6 @@ export default function WebsiteEvolutionViewer() {
               >
                 {isLoading ? "Rewinding…" : "Start rewinding"}
               </Button>
-
-              <button
-                type="button"
-                onClick={openApyhubPreview}
-                className="w-full text-[10px] uppercase tracking-[0.3em] font-serif opacity-50 hover:opacity-90 transition-opacity pt-1"
-                style={{ color: "var(--reel-paper)" }}
-              >
-                ▸ preview an existing reel (apyhub7 · 6 frames)
-              </button>
             </form>
           </Form>
         </div>
@@ -797,18 +802,30 @@ export default function WebsiteEvolutionViewer() {
         )}
       </AnimatePresence>
 
-      {/* Cinematic stage portal */}
+      {/* Interactive vertical timeline — inline, not a portal. */}
       <AnimatePresence>
         {stageOpen && evolutionImages.length > 0 && submittedValues && (
-          <CinematicStage
-            frames={buildFrames(
-              evolutionImages,
-              submittedValues.startYear,
-              submittedValues.endYear
-            )}
+          <InteractiveTimeline
+            frames={
+              finalTimestamps.length === evolutionImages.length
+                ? buildFramesFromManifest(
+                    evolutionImages,
+                    finalTimestamps,
+                    submittedValues.startYear,
+                    submittedValues.endYear
+                  )
+                : buildFrames(
+                    evolutionImages,
+                    submittedValues.startYear,
+                    submittedValues.endYear
+                  )
+            }
             url={submittedValues.url}
             startYear={submittedValues.startYear}
             endYear={submittedValues.endYear}
+            cacheKey={finalCacheKey}
+            summaries={finalSummaries}
+            gifUrl={finalGifUrl}
             onClose={() => setStageOpen(false)}
           />
         )}

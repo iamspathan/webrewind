@@ -17,6 +17,7 @@ const { createCache } = require("./util/cache");
 const { createStreamingGifEncoder } = require("./util/gif");
 const storage = require("./util/storage");
 const metrics = require("./util/metrics");
+const summarize = require("./util/summarize");
 
 // outputFileName validation — stays in this file so the route handler has
 // a single source of truth. Also used as an object-key prefix in MinIO.
@@ -63,6 +64,10 @@ const mUploadsTotal = metrics.counter(
 const mUploadErrors = metrics.counter(
   "webrewind_upload_errors_total",
   "Failed object uploads by kind"
+);
+const mSummariesTotal = metrics.counter(
+  "webrewind_summaries_total",
+  "Image summary requests by outcome"
 );
 
 const resultCache = createCache({ storage });
@@ -200,6 +205,7 @@ function coarseRoute(p) {
   if (p === "/screenshots") return "/screenshots";
   if (p.startsWith("/screenshots/events/")) return "/screenshots/events/:id";
   if (p.startsWith("/screenshots/")) return "/screenshots/:id";
+  if (p === "/summaries") return "/summaries";
   if (p === "/metrics" || p === "/health" || p === "/docs") return p;
   if (p.startsWith("/docs")) return "/docs";
   return "other";
@@ -221,6 +227,32 @@ const screenshotsRateLimiter = rateLimit({
       )
       .json({
         error: "too many capture requests",
+        retryAfterSec: Math.ceil(RATE_LIMIT_WINDOW_MS / 1000),
+      });
+  },
+});
+
+// Summaries hit an external LLM — we want a higher burst budget than
+// capture submissions (one timeline view can fire dozens as cards scroll
+// past) but we still protect the upstream from a runaway client.
+const SUMMARY_RATE_LIMIT_MAX = Math.max(
+  1,
+  Number(process.env.SUMMARY_RATE_LIMIT_MAX || 60)
+);
+const summariesRateLimiter = rateLimit({
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  max: SUMMARY_RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (_req, res) => {
+    res
+      .status(429)
+      .set(
+        "Retry-After",
+        String(Math.ceil(RATE_LIMIT_WINDOW_MS / 1000))
+      )
+      .json({
+        error: "too many summary requests",
         retryAfterSec: Math.ceil(RATE_LIMIT_WINDOW_MS / 1000),
       });
   },
@@ -350,17 +382,29 @@ let retireRequested = false;
 let activeJobCount = 0;
 
 async function launchBrowser() {
+  // Mirror INSECURE_TLS into Chromium. The axios client in util/wayback.js
+  // already respects this flag for the CDX API; Chromium has its own cert
+  // store and needs the CLI switch. Dev-only (corporate MITM); remove in
+  // production by leaving INSECURE_TLS unset.
+  const insecureTls =
+    String(process.env.INSECURE_TLS || "").toLowerCase() === "true";
+  const args = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage", // avoid small /dev/shm in containers
+    "--disable-gpu",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+  ];
+  if (insecureTls) args.push("--ignore-certificate-errors");
   const browser = await puppeteer.launch({
-    headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage", // avoid small /dev/shm in containers
-      "--disable-gpu",
-      "--disable-background-timer-throttling",
-      "--disable-backgrounding-occluded-windows",
-      "--disable-renderer-backgrounding",
-    ],
+    // "new" opts into Chrome's new headless mode (shares code path with
+    // headful Chrome). Puppeteer 19.x warns about the default flipping
+    // from the old implementation; opting in now makes the warning go
+    // away and avoids a surprise behaviour change on upgrade.
+    headless: "new",
+    args,
   });
   browser.on("disconnected", () => {
     // Only null out if this is still the current handle; a stale
@@ -598,6 +642,10 @@ async function run(
   // Accumulate image URLs in index order for the final "done" event +
   // cache manifest. Workers write via index so order is preserved.
   const imageUrls = new Array(urls.length).fill(null);
+  // Wayback timestamps aligned 1:1 with imageUrls. Only set for
+  // successfully-captured frames; skipped frames stay `null` and are
+  // filtered out at the end alongside the URL.
+  const timestamps = new Array(urls.length).fill(null);
 
   let nextIndex = 0;
   let successCount = 0;
@@ -681,6 +729,7 @@ async function run(
         frameKey(outputFileName, index, ext)
       );
       imageUrls[index] = publicUrl;
+      timestamps[index] = timestamp || null;
       publish({
         type: "capture:done",
         index,
@@ -703,9 +752,22 @@ async function run(
 
   if (isAborted()) throw new CancelledError();
 
+  // Filter to successful frames while keeping images and timestamps
+  // aligned by index. A single filter on imageUrls would desync the two
+  // arrays if any frame was skipped.
+  const imagesOut = [];
+  const timestampsOut = [];
+  for (let i = 0; i < imageUrls.length; i++) {
+    if (imageUrls[i]) {
+      imagesOut.push(imageUrls[i]);
+      timestampsOut.push(timestamps[i] || null);
+    }
+  }
+
   return {
     count: successCount,
-    images: imageUrls.filter(Boolean),
+    images: imagesOut,
+    timestamps: timestampsOut,
   };
 }
 
@@ -726,12 +788,18 @@ async function run(
  *         application/json:
  *           schema:
  *             type: object
- *             required: [url, startYear, endYear, outputFileName]
+ *             required: [url, startYear, endYear]
  *             properties:
  *               url: { type: string }
  *               startYear: { type: integer }
  *               endYear: { type: integer }
- *               outputFileName: { type: string }
+ *               outputFileName:
+ *                 type: string
+ *                 description: |
+ *                   Optional object-key prefix in MinIO. Must match
+ *                   [A-Za-z0-9_-]{1,64} when supplied. If omitted, the
+ *                   server derives a stable prefix from the cache key so
+ *                   identical requests share a storage location.
  *               format: { type: string, enum: [png, jpeg], default: png }
  *               quality: { type: integer, minimum: 1, maximum: 100, default: 80 }
  *     responses:
@@ -757,7 +825,7 @@ app.post("/screenshots", screenshotsRateLimiter, async (req, res) => {
     url,
     startYear,
     endYear,
-    outputFileName,
+    outputFileName: rawOutputFileName,
     format: rawFormat,
     quality: rawQuality,
   } = req.body || {};
@@ -771,10 +839,20 @@ app.post("/screenshots", screenshotsRateLimiter, async (req, res) => {
   if (!Number.isInteger(ey) || ey < 1900) errs.push("endYear invalid");
   if (Number.isInteger(sy) && Number.isInteger(ey) && sy > ey)
     errs.push("startYear must be <= endYear");
-  if (typeof outputFileName !== "string" || !SAFE_NAME_RE.test(outputFileName))
+  // outputFileName is now optional. If the caller supplies one we still
+  // enforce the old charset constraint so arbitrary strings can't be used
+  // as object-key prefixes in MinIO. If omitted, we derive a stable value
+  // from the cache key below so MinIO writes still happen under a
+  // deterministic prefix per (url, years, format, quality).
+  if (
+    rawOutputFileName !== undefined &&
+    (typeof rawOutputFileName !== "string" ||
+      !SAFE_NAME_RE.test(rawOutputFileName))
+  ) {
     errs.push(
-      "outputFileName must match [A-Za-z0-9_-]{1,64} (no spaces or slashes)"
+      "outputFileName, when provided, must match [A-Za-z0-9_-]{1,64} (no spaces or slashes)"
     );
+  }
 
   // Optional format/quality. Defaults preserve pre-#21 behavior (PNG).
   let format = "png";
@@ -799,17 +877,8 @@ app.post("/screenshots", screenshotsRateLimiter, async (req, res) => {
     return res.status(400).json({ error: "invalid parameters", details: errs });
   }
 
-  // Reject duplicate in-flight jobs for the same output name — otherwise the
-  // second job's deletePrefix() would wipe objects the first is uploading.
-  if (activeOutputs.has(outputFileName)) {
-    return res.status(409).json({
-      error: "a capture is already running for this outputFileName",
-    });
-  }
-
-  // Cache lookup. Key is derived from (url, range, format, quality) — the
-  // outputFileName is a display label and is NOT part of the key. A hit
-  // returns immediately with the cached image URLs.
+  // Cache lookup. Key is derived from (url, range, format, quality) —
+  // stable per logical request.
   const hitKey = resultCache.key({
     url,
     startYear: sy,
@@ -817,6 +886,28 @@ app.post("/screenshots", screenshotsRateLimiter, async (req, res) => {
     format,
     quality,
   });
+
+  // If the caller didn't supply an outputFileName, derive one from the
+  // first 16 hex chars of the cache key. This is deterministic per
+  // request tuple, so:
+  //   - Two concurrent identical requests land on the same active-jobs
+  //     slot (the 409 guard below becomes a dedupe mutex — desirable,
+  //     the second request would have been a cache hit anyway).
+  //   - Re-captures for the same tuple overwrite the same MinIO prefix,
+  //     which is what the existing `deletePrefix` before capture expects.
+  const outputFileName =
+    typeof rawOutputFileName === "string" && rawOutputFileName.length > 0
+      ? rawOutputFileName
+      : hitKey.slice(0, 16);
+
+  // Reject duplicate in-flight jobs for the same output name — otherwise the
+  // second job's deletePrefix() would wipe objects the first is uploading.
+  if (activeOutputs.has(outputFileName)) {
+    return res.status(409).json({
+      error: "a capture is already running for this request",
+    });
+  }
+
   const hit = resultCache.enabled ? await resultCache.lookup(hitKey) : null;
 
   const { jobId, job } = createJob(outputFileName, req.id);
@@ -841,6 +932,16 @@ app.post("/screenshots", screenshotsRateLimiter, async (req, res) => {
     publish({
       type: "done",
       images: hit.images,
+      // Older manifests predate timestamps; send [] so the client takes
+      // the approx-year code path without needing a null check.
+      timestamps: Array.isArray(hit.timestamps) ? hit.timestamps : [],
+      // Cached summaries — empty array if the old manifest didn't track
+      // them. Client lazy-fetches any missing slots.
+      summaries: Array.isArray(hit.summaries) ? hit.summaries : [],
+      // Client uses cacheKey to address /summaries POSTs back into this
+      // manifest. Safe to expose — it's derived from public inputs +
+      // sha256, not a secret.
+      cacheKey: hitKey,
       gif: hit.gifUrl || null,
       count: hit.count || hit.images.length,
       cached: true,
@@ -867,7 +968,7 @@ app.post("/screenshots", screenshotsRateLimiter, async (req, res) => {
     // work with Puppeteer so the encoding tail at the end is ~0.
     const gifEncoder = createStreamingGifEncoder({});
     try {
-      const { count, images } = await run(
+      const { count, images, timestamps } = await run(
         url,
         sy,
         ey,
@@ -904,12 +1005,24 @@ app.post("/screenshots", screenshotsRateLimiter, async (req, res) => {
         publish({ type: "gif:failed", reason: e.message });
       }
 
-      publish({ type: "done", images, gif: gifUrl, count });
+      publish({
+        type: "done",
+        images,
+        timestamps,
+        // Fresh capture: summaries are generated lazily by the client,
+        // so start empty. The cache manifest is initialized with the
+        // same empty slots and filled in via patchSummary() later.
+        summaries: new Array(images.length).fill(""),
+        cacheKey: hitKey,
+        gif: gifUrl,
+        count,
+      });
       // Record cache entry only on genuine success (at least one image).
       if (resultCache.enabled && images.length > 0) {
         await resultCache.record(hitKey, {
           outputFileName,
           images,
+          timestamps,
           gifUrl,
           count,
         });
@@ -1046,6 +1159,114 @@ app.get("/screenshots/events/:jobId", (req, res) => {
   req.on("close", cleanup);
   res.on("close", cleanup);
   res.on("error", cleanup);
+});
+
+/**
+ * @swagger
+ * /summaries:
+ *   post:
+ *     summary: Generate an AI caption for a single captured frame
+ *     description: |
+ *       Proxies to the NVIDIA-hosted Gemma 3n vision model. The API key
+ *       stays server-side; clients pass an image URL that must live in
+ *       our own MinIO bucket. On success, the summary is written back
+ *       into the result cache so future cache hits don't re-bill the LLM.
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [cacheKey, frameIndex, imageUrl]
+ *             properties:
+ *               cacheKey: { type: string, description: "sha256 hex returned in the done SSE event" }
+ *               frameIndex: { type: integer }
+ *               imageUrl: { type: string, description: "must start with MINIO_PUBLIC_URL/BUCKET/" }
+ *     responses:
+ *       200: { description: "{ summary }" }
+ *       400: { description: Invalid parameters }
+ *       404: { description: Image object not found }
+ *       429: { description: Upstream rate limit }
+ *       502: { description: Upstream error }
+ *       503: { description: Summaries disabled (no NVIDIA_API_KEY configured) }
+ */
+app.post("/summaries", summariesRateLimiter, async (req, res) => {
+  if (!summarize.isEnabled()) {
+    return res.status(503).json({
+      error: "summaries are disabled (NVIDIA_API_KEY not set)",
+    });
+  }
+
+  const { cacheKey, frameIndex, imageUrl } = req.body || {};
+  const errs = [];
+  if (typeof cacheKey !== "string" || !/^[a-f0-9]{64}$/.test(cacheKey)) {
+    errs.push("cacheKey must be a sha256 hex string");
+  }
+  if (!Number.isInteger(frameIndex) || frameIndex < 0 || frameIndex > 10_000) {
+    errs.push("frameIndex must be a non-negative integer");
+  }
+  if (typeof imageUrl !== "string" || imageUrl.length === 0) {
+    errs.push("imageUrl is required");
+  }
+  if (errs.length) {
+    return res.status(400).json({ error: "invalid parameters", details: errs });
+  }
+
+  // Enforce that the image lives in our bucket. Without this check the
+  // endpoint would happily download and bill on any URL the caller
+  // supplies — an easy pivot for abuse.
+  const objectKey = storage.keyFromPublicUrl(imageUrl);
+  if (!objectKey) {
+    mSummariesTotal.inc({ outcome: "rejected" });
+    return res
+      .status(400)
+      .json({ error: "imageUrl must point at this server's bucket" });
+  }
+
+  let object;
+  try {
+    object = await storage.getObjectBytes(objectKey);
+  } catch (err) {
+    mSummariesTotal.inc({ outcome: "storage-error" });
+    log.warn("summaries: storage fetch failed", {
+      key: objectKey,
+      err: err.message,
+    });
+    return res.status(502).json({ error: "could not fetch image" });
+  }
+  if (!object || !object.body) {
+    mSummariesTotal.inc({ outcome: "not-found" });
+    return res.status(404).json({ error: "image not found" });
+  }
+
+  try {
+    const summary = await summarize.summarizeImage(
+      object.body,
+      object.contentType
+    );
+
+    // Fire-and-forget cache write. A failure here just means the next
+    // request for the same slot will regenerate — we still return the
+    // summary the client is waiting on.
+    resultCache
+      .patchSummary(cacheKey, frameIndex, summary)
+      .catch(() => {});
+
+    mSummariesTotal.inc({ outcome: "ok" });
+    return res.json({ summary });
+  } catch (err) {
+    const status = (err && err.status) || 502;
+    mSummariesTotal.inc({
+      outcome: status === 429 ? "rate-limited" : "upstream-error",
+    });
+    if (status === 429 && err.upstreamStatus === 429) {
+      res.set("Retry-After", "30");
+    }
+    return res.status(status).json({
+      error: err.message || "summary failed",
+      upstreamStatus: (err && err.upstreamStatus) || undefined,
+    });
+  }
 });
 
 // ---------- 404 fallback ----------

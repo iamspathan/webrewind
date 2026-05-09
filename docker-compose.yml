@@ -65,6 +65,16 @@ services:
       MINIO_BUCKET: webrewind
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
+      # DEV ONLY — disables TLS cert verification on the Wayback axios
+      # client. Needed on networks with SSL inspection (corporate proxy /
+      # Zscaler). Remove this line on Oracle Cloud / any public-internet
+      # deployment, where cert chains are clean.
+      INSECURE_TLS: "true"
+      # AI captions. Pulled from the repo-root .env (gitignored) via
+      # compose variable interpolation — keeps the secret out of source.
+      # Empty → /summaries returns 503 and the feature is effectively off.
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
+      SUMMARY_MODEL: ${SUMMARY_MODEL:-google/gemma-3n-e4b-it}
     depends_on:
       minio-init:
         condition: service_completed_successfully

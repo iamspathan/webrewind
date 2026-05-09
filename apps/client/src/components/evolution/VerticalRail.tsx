@@ -5,14 +5,30 @@ import type { Frame } from "./types";
 
 interface Props {
   frames: Frame[];
-  currentIndex: number;
-  onScrub: (i: number) => void;
+  activeIndex: number;
+  onJump: (index: number) => void;
 }
 
-export function TimelineRail({ frames, currentIndex, onScrub }: Props) {
+/**
+ * Vertical sibling of the old horizontal TimelineRail. A sticky column on
+ * the left of InteractiveTimeline: SVG line with one dot + year label per
+ * frame. `activeIndex` is driven by the parent's IntersectionObserver;
+ * clicking a dot asks the parent to scroll its card into view.
+ *
+ * The viewBox height is sized per-mount so rows stay evenly spaced no
+ * matter how many frames the job returned.
+ */
+export function VerticalRail({ frames, activeIndex, onJump }: Props) {
   const svgRef = useRef<SVGSVGElement>(null);
   const mountedRef = useRef(false);
   const reduced = usePrefersReducedMotion();
+
+  // Space rows at a fixed step in SVG user units. 10px of headroom top &
+  // bottom so the endpoints don't clip against the container.
+  const ROW = 16;
+  const TOP = 10;
+  const viewH = TOP * 2 + Math.max(0, frames.length - 1) * ROW;
+  const divisor = Math.max(1, frames.length - 1);
 
   useEffect(() => {
     if (!svgRef.current || mountedRef.current) return;
@@ -54,59 +70,49 @@ export function TimelineRail({ frames, currentIndex, onScrub }: Props) {
     }
   }, [reduced]);
 
-  const divisor = Math.max(1, frames.length - 1);
-  const playheadX = (currentIndex / divisor) * 100;
-
-  const handleClick = (e: React.MouseEvent<SVGSVGElement>) => {
-    if (!svgRef.current) return;
-    const rect = svgRef.current.getBoundingClientRect();
-    const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-    const idx = Math.round(ratio * divisor);
-    onScrub(idx);
-  };
+  const playheadY = TOP + (activeIndex / divisor) * (viewH - TOP * 2);
 
   return (
     <svg
       ref={svgRef}
-      viewBox="0 0 100 12"
-      preserveAspectRatio="none"
-      className="w-full h-14 cursor-pointer"
-      onClick={handleClick}
-      role="slider"
-      aria-valuemin={0}
-      aria-valuemax={frames.length - 1}
-      aria-valuenow={currentIndex}
-      aria-label="Timeline scrubber"
+      viewBox={`0 0 60 ${viewH}`}
+      preserveAspectRatio="xMidYMin meet"
+      className="h-full w-full"
+      role="list"
+      aria-label="Timeline milestones"
     >
       <path
         data-rail
-        d="M 0.5 5 L 99.5 5"
+        d={`M 18 ${TOP} L 18 ${viewH - TOP}`}
         stroke="var(--reel-sepia)"
-        strokeWidth="0.25"
+        strokeWidth="0.5"
         strokeLinecap="round"
         fill="none"
         opacity={0.7}
       />
       {frames.map((f, i) => {
-        const x = (i / divisor) * 100;
-        const isActive = i === currentIndex;
+        const y = TOP + (i / divisor) * (viewH - TOP * 2);
+        const isActive = i === activeIndex;
         return (
           <g
             key={f.index}
             data-dot
-            transform={`translate(${x} 5)`}
-            style={{ transformOrigin: "center" }}
+            transform={`translate(18 ${y})`}
+            style={{ transformOrigin: "center", cursor: "pointer" }}
+            onClick={() => onJump(i)}
+            role="listitem"
+            aria-current={isActive ? "true" : undefined}
           >
             <circle
-              r={isActive ? 1.1 : 0.55}
+              r={isActive ? 2.4 : 1.2}
               fill={isActive ? "var(--reel-amber)" : "var(--reel-paper)"}
               style={{ transition: "r 260ms ease, fill 260ms ease" }}
             />
-            {isActive && (
-              <circle r={2.4} fill="var(--reel-amber)" opacity={0.22}>
+            {isActive && !reduced && (
+              <circle r={4.5} fill="var(--reel-amber)" opacity={0.22}>
                 <animate
                   attributeName="r"
-                  values="1.6;2.8;1.6"
+                  values="3.2;5.2;3.2"
                   dur="1.6s"
                   repeatCount="indefinite"
                 />
@@ -116,36 +122,38 @@ export function TimelineRail({ frames, currentIndex, onScrub }: Props) {
         );
       })}
       <line
-        x1={playheadX}
-        x2={playheadX}
-        y1={2}
-        y2={8}
+        x1={12}
+        x2={24}
+        y1={playheadY}
+        y2={playheadY}
         stroke="var(--reel-amber-glow)"
-        strokeWidth={0.2}
+        strokeWidth={0.5}
         strokeLinecap="round"
         style={{
           transition: "all 420ms cubic-bezier(0.22, 1, 0.36, 1)",
-          filter: "drop-shadow(0 0 0.6px var(--reel-amber))",
+          filter: "drop-shadow(0 0 1px var(--reel-amber))",
         }}
       />
       {frames.map((f, i) => {
-        const showEveryNth = Math.max(1, Math.ceil(frames.length / 8));
-        if (i !== 0 && i !== frames.length - 1 && i % showEveryNth !== 0) return null;
-        const x = (i / divisor) * 100;
+        const y = TOP + (i / divisor) * (viewH - TOP * 2);
+        const isActive = i === activeIndex;
         return (
           <text
             key={`yr-${f.index}`}
             data-yr
-            x={x}
-            y={11}
-            textAnchor="middle"
-            fontSize={1.5}
+            x={30}
+            y={y + 1.2}
+            fontSize={3.5}
             fill="var(--reel-paper)"
-            opacity={0}
+            opacity={isActive ? 0.95 : 0.55}
             style={{
               fontFamily: '"IBM Plex Serif", Georgia, serif',
               letterSpacing: "0.1em",
+              transition: "opacity 260ms ease",
+              cursor: "pointer",
+              fontVariantNumeric: "tabular-nums",
             }}
+            onClick={() => onJump(i)}
           >
             {f.year}
           </text>

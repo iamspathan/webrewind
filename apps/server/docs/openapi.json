@@ -79,6 +79,60 @@
           }
         }
       }
+    },
+    "/summaries": {
+      "post": {
+        "summary": "Generate an AI caption for a single captured frame",
+        "description": "Proxies to the NVIDIA-hosted Gemma 3n vision model. The API key\nstays server-side; clients pass an image URL that must live in\nour own MinIO bucket. On success, the summary is written back\ninto the result cache so future cache hits don't re-bill the LLM.\n",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "cacheKey",
+                  "frameIndex",
+                  "imageUrl"
+                ],
+                "properties": {
+                  "cacheKey": {
+                    "type": "string",
+                    "description": "sha256 hex returned in the done SSE event"
+                  },
+                  "frameIndex": {
+                    "type": "integer"
+                  },
+                  "imageUrl": {
+                    "type": "string",
+                    "description": "must start with MINIO_PUBLIC_URL/BUCKET/"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "{ summary }"
+          },
+          "400": {
+            "description": "Invalid parameters"
+          },
+          "404": {
+            "description": "Image object not found"
+          },
+          "429": {
+            "description": "Upstream rate limit"
+          },
+          "502": {
+            "description": "Upstream error"
+          },
+          "503": {
+            "description": "Summaries disabled (no NVIDIA_API_KEY configured)"
+          }
+        }
+      }
     }
   },
   "components": {},

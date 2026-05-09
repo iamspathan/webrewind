@@ -59,6 +59,25 @@ async function putObject(key, body, contentType, extra = {}) {
     .promise();
 }
 
+async function getObjectBytes(key) {
+  try {
+    const data = await s3.getObject({ Bucket: BUCKET, Key: key }).promise();
+    return {
+      body: data.Body,
+      contentType: data.ContentType || "application/octet-stream",
+    };
+  } catch (err) {
+    if (
+      err.code === "NoSuchKey" ||
+      err.code === "NotFound" ||
+      err.statusCode === 404
+    ) {
+      return null;
+    }
+    throw err;
+  }
+}
+
 async function getObjectJSON(key) {
   try {
     const data = await s3.getObject({ Bucket: BUCKET, Key: key }).promise();
@@ -136,12 +155,30 @@ async function ensureBucket() {
   }
 }
 
+// Strip the known public URL prefix off a browser-facing image URL and
+// return the bucket-relative key. Returns null if the URL doesn't live in
+// our bucket — callers must treat that as "reject the request" rather
+// than blindly passing through, since we'd otherwise accept arbitrary
+// URLs as input to the summarizer.
+function keyFromPublicUrl(publicUrl) {
+  if (typeof publicUrl !== "string" || publicUrl.length === 0) return null;
+  const prefix = `${PUBLIC_URL}/${BUCKET}/`;
+  if (!publicUrl.startsWith(prefix)) return null;
+  try {
+    return decodeURI(publicUrl.slice(prefix.length));
+  } catch {
+    return null;
+  }
+}
+
 module.exports = {
   BUCKET,
   putObject,
   getObjectJSON,
+  getObjectBytes,
   deleteObject,
   deletePrefix,
   buildPublicUrl,
+  keyFromPublicUrl,
   ensureBucket,
 };

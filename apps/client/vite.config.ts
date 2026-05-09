@@ -17,6 +17,7 @@ export default defineConfig(({ mode }) => {
       port: 5173,
       proxy: {
         "/screenshots": { target: apiTarget, changeOrigin: true },
+        "/summaries": { target: apiTarget, changeOrigin: true },
         "/health": { target: apiTarget, changeOrigin: true },
         "/docs": { target: apiTarget, changeOrigin: true },
       },
